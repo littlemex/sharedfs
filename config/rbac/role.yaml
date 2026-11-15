@@ -1,0 +1,61 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  - persistentvolumes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - sharedfs.littlemex.github.io
+  resources:
+  - sharedfilesystemclaims
+  - sharedfilesystems
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - sharedfs.littlemex.github.io
+  resources:
+  - sharedfilesystemclaims/finalizers
+  - sharedfilesystems/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - sharedfs.littlemex.github.io
+  resources:
+  - sharedfilesystemclaims/status
+  - sharedfilesystems/status
+  verbs:
+  - get
+  - patch
+  - update

@@ -1,0 +1,9 @@
+apiVersion: sharedfs.littlemex.github.io/v1alpha1
+kind: SharedFilesystem
+metadata:
+  labels:
+    app.kubernetes.io/name: sharedfs
+    app.kubernetes.io/managed-by: kustomize
+  name: sharedfilesystem-sample
+spec:
+  # TODO(user): Add fields here

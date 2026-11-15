@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- sharedfs_v1alpha1_sharedfilesystem.yaml
+- sharedfs_v1alpha1_sharedfilesystemclaim.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
