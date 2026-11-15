@@ -40,7 +40,7 @@ Pods in `team-a` then mount `persistentVolumeClaim: {claimName: data}`.
 
 | Guarantee | How |
 |---|---|
-| A generated volume exists only while its SharedFilesystem exists and grants its namespace the access it has | Grants are evaluated on every reconcile, before any other check. A namespace that loses its grant has its PersistentVolumeClaim deleted after a grace period (`--revocation-grace-period`, default 30s) and a live re-read of the namespace and the SharedFilesystem |
+| A generated volume can be newly mounted only while its SharedFilesystem exists and grants its namespace the access it has | Grants are evaluated on every reconcile, before any other check. When a claim stops being granted, `status.withdrawAfter` is set to now plus `--revocation-grace-period` (default 30s, one-second resolution); if the grant is still missing then, on a live re-read of the namespace and the SharedFilesystem, the PersistentVolumeClaim is deleted. Pods already running keep their mount until they stop, and the claim's `Ready` message names them |
 | No other namespace can bind a generated volume | Each PersistentVolume is reserved with `claimRef` (namespace and name) for exactly one PersistentVolumeClaim |
 | Deleting a generated volume never deletes the file system | Generated PersistentVolumes are always `Retain`, carry their own `volumeHandle`, and copy no provisioner annotation from the source |
 | `ReadOnly` is enforced at mount time | The `ro` mount option. Both FSx CSI drivers reject the `ReadOnlyMany` access mode, so generated volumes are `ReadWriteMany` with `ro` added for read-only claims |
@@ -52,7 +52,7 @@ Pods in `team-a` then mount `persistentVolumeClaim: {claimName: data}`.
 
 - **Isolation.** Every namespace granted `ReadWrite` can modify the whole file system. Use separate file systems, or FSx for OpenZFS child volumes, for isolation.
 - **Stopping running pods.** Revoking access deletes the PersistentVolumeClaim; pods already running keep their mount until they stop, and new pods cannot start. Evict them if access must end at once.
-- **Namespace label security.** Grants select namespaces by label. Tenants must not be able to edit those labels; selecting on `kubernetes.io/metadata.name` avoids the question.
+- **Namespace label security.** Grants select namespaces by label. Tenants must not be able to edit those labels, nor write `sharedfilesystemclaims/status`; selecting on `kubernetes.io/metadata.name` avoids the label question. A grant's selector must not be empty; to grant every namespace, match `kubernetes.io/metadata.name` with operator `Exists`.
 - **EFS.** `efs.csi.aws.com` mounts from `volumeHandle`, so a generated volume cannot carry its own handle. It is not supported.
 - **Following source changes.** If the source PersistentVolume's CSI fields change, existing volumes keep the old ones and claims report `Ready=False (SourceChanged)`. Recreate the claim to remount.
 
@@ -81,8 +81,8 @@ A claim has three conditions. `Accepted` says whether the namespace is granted t
 
 | Condition | Reasons |
 |---|---|
-| `Accepted` | `Accepted`, `NamespaceNotGranted`, `AccessNotGranted`, `FilesystemNotFound` (these three withdraw access), `FilesystemDeleting`, `FilesystemNotReady` (these keep existing volumes) |
-| `Bound` | `Bound`, `NoVolume`, `PVCPending`, `PVCConflict`, `PVCTerminating`, `PVCLost`, `PVCCreateFailed`, `VolumeTerminating` |
+| `Accepted` | `Accepted`; `NamespaceNotGranted`, `AccessNotGranted`, `FilesystemNotFound` (these three withdraw access after the grace period); `FilesystemDeleting` and the SharedFilesystem's own reasons such as `SourceNotFound` or `InvalidGrant` (these keep existing volumes) |
+| `Bound` | `Bound`, `NoVolume`, `PVCPending`, `PVCConflict`, `PVCTerminating`, `PVCLost`, `PVCCreateFailed`, `VolumeApplyFailed`, `VolumeTerminating` |
 | `Ready` | `Ready`, `Revoking`, `SourceChanged`, `Deleting`, or the reason copied from `Accepted` / `Bound` |
 
 A SharedFilesystem has `Ready` with `Resolved`, `SourceNotFound`, `SourceNotCSI`, `UnsupportedDriver`, `SourceIsGenerated`, `InvalidSource`, `InvalidGrant` or `VolumesRemaining`. A source with `reclaimPolicy: Delete` resolves, with a warning in the message and an event, because deleting that source's own PVC deletes the file system.
@@ -113,7 +113,7 @@ runs the unit tests and the controller tests against a local API server ([envtes
 test/e2e-eks/run.sh <source PersistentVolume> <node name>
 ```
 
-It mounts a read-write and a read-only claim on one node, writes and reads a nonce, checks that the read-only mount refuses writes, that an ungranted namespace gets nothing, that a recreated PVC rebinds, that revocation keeps the volume through the grace period and then withdraws it, and that deletion goes PVC, then PersistentVolume, then claim. It cleans up after itself and writes one directory, which it removes, on the file system.
+It mounts a read-write and a read-only claim on one node (claims are Ready about 25 seconds after creation: binding a reserved PersistentVolume waits for the PV controller's periodic sync), writes and reads a nonce, checks that the read-only mount refuses writes, that an ungranted namespace gets nothing, that a recreated PVC rebinds, that revocation keeps the volume through the grace period and then withdraws it, and that deletion goes PVC, then PersistentVolume, then claim. It cleans up after itself and writes one directory, which it removes, on the file system.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the reasoning behind each choice.
 
