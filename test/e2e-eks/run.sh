@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end check of sharedfs on a real cluster with a real FSx file system.
 #
-# Usage: test/e2e-eks/run.sh <source PV name> <node name> [<label prefix>]
+# Usage: test/e2e-eks/run.sh <source PV name> <node name>
+#   CTRL_NS / CTRL_DEPLOY  where the controller runs (step 5b stops and restarts it)
 #   source PV  an existing static PV of fsx.csi.aws.com or fsx.openzfs.csi.aws.com
 #   node       a node that can mount it; both probe pods run there (same-node rw and ro mounts)
 #
@@ -16,6 +17,7 @@ P=sfse2e-$ID; NS_RW=$P-rw; NS_RO=$P-ro; NS_NONE=$P-none
 KEY=sharedfs-e2e/$P
 DIR=/shared/.sharedfs-e2e-$ID
 GRACE=${GRACE:-30}
+CTRL_NS=${CTRL_NS:-sharedfs-system}; CTRL_DEPLOY=${CTRL_DEPLOY:-sharedfs-controller-manager}
 PASS=0; FAIL=0
 
 ok()   { PASS=$((PASS+1)); echo "[PASS] $*"; }
@@ -133,6 +135,24 @@ RV1=$(kubectl get pv "$RW_PV" -o jsonpath='{.metadata.resourceVersion}')
 kubectl -n "$NS_RW" annotate sfc data sharedfs-e2e/poke="$(date +%s)" --overwrite >/dev/null; sleep 10
 check "PV resourceVersion unchanged after a reconcile" sh -c "[ \"\$(kubectl get pv $RW_PV -o jsonpath='{.metadata.resourceVersion}')\" = $RV1 ]"
 
+step "4b. deleting a granted claim in use waits for its pod, then PVC, PV and claim go in order"
+kubectl apply -f - >/dev/null <<EOF
+apiVersion: sharedfs.littlemex.github.io/v1alpha1
+kind: SharedFilesystemClaim
+metadata: {name: inuse, namespace: $NS_RW}
+spec: {filesystemRef: {name: $P}}
+EOF
+check "inuse claim Ready" wait_for 90 cond_is "$NS_RW" inuse Ready True/Ready
+INUSE_PV=$(kubectl -n "$NS_RW" get sfc inuse -o jsonpath='{.status.persistentVolumeName}')
+pod "$NS_RW" u inuse
+check "its pod is running" wait_for 120 running "$NS_RW" u
+kubectl -n "$NS_RW" delete sfc inuse --wait=false >/dev/null
+check "claim waits (Deleting) while the pod runs" wait_for 30 cond_is "$NS_RW" inuse Ready False/Deleting
+sleep 10
+check "the PV is not deleted while the PVC is in use" sh -c "[ -z \"\$(kubectl get pv $INUSE_PV -o jsonpath='{.metadata.deletionTimestamp}')\" ]"
+kubectl -n "$NS_RW" delete pod u --wait=true >/dev/null
+check "claim, PVC and PV are gone once the pod stops" wait_for 90 sh -c "! kubectl -n $NS_RW get sfc inuse >/dev/null 2>&1 && ! kubectl -n $NS_RW get pvc inuse >/dev/null 2>&1 && ! kubectl get pv $INUSE_PV >/dev/null 2>&1"
+
 step "5. revoking a namespace: grace period, running pod keeps its mount, new pods do not start"
 kubectl label ns "$NS_RO" "$KEY-" >/dev/null
 check "claim reports NamespaceNotGranted" wait_for 30 cond_is "$NS_RO" data Accepted False/NamespaceNotGranted
@@ -147,18 +167,24 @@ kubectl -n "$NS_RO" get events --field-selector involvedObject.name=r2 -o custom
 kubectl -n "$NS_RO" delete pod r r2 --wait=true >/dev/null
 check "PVC and PV are gone once the pods stop" wait_for 90 sh -c "! kubectl -n $NS_RO get pvc data >/dev/null 2>&1 && [ -z \"\$(kubectl -n $NS_RO get sfc data -o jsonpath='{.status.persistentVolumeName}')\" ]"
 
-step "5b. a claim removed without its finalizer leaves nothing behind"
+step "5b. a claim removed while the controller is down leaves nothing behind"
 kubectl apply -f - >/dev/null <<EOF
 apiVersion: sharedfs.littlemex.github.io/v1alpha1
 kind: SharedFilesystemClaim
 metadata: {name: stray, namespace: $NS_RW}
 spec: {filesystemRef: {name: $P}}
 EOF
-check "stray claim Ready" wait_for 60 cond_is "$NS_RW" stray Ready True/Ready
+check "stray claim Ready" wait_for 90 cond_is "$NS_RW" stray Ready True/Ready
 STRAY_PV=$(kubectl -n "$NS_RW" get sfc stray -o jsonpath='{.status.persistentVolumeName}')
+# With the controller stopped, the claim's own finalizer cannot run: only the orphan sweep at
+# startup can remove what is left.
+kubectl -n "$CTRL_NS" scale deploy "$CTRL_DEPLOY" --replicas=0 >/dev/null
+kubectl -n "$CTRL_NS" wait --for=delete pod -l control-plane=controller-manager --timeout=120s >/dev/null 2>&1
 kubectl -n "$NS_RW" delete sfc stray --wait=false >/dev/null
-kubectl -n "$NS_RW" patch sfc stray --type=merge -p '{"metadata":{"finalizers":null}}' >/dev/null 2>&1
-check "its PVC and PV are swept" wait_for 60 sh -c "! kubectl -n $NS_RW get pvc stray >/dev/null 2>&1 && ! kubectl get pv $STRAY_PV >/dev/null 2>&1"
+kubectl -n "$NS_RW" patch sfc stray --type=merge -p '{"metadata":{"finalizers":null}}' >/dev/null
+check "the claim is gone and its PVC and PV are still there" sh -c "! kubectl -n $NS_RW get sfc stray >/dev/null 2>&1 && kubectl -n $NS_RW get pvc stray >/dev/null 2>&1 && kubectl get pv $STRAY_PV >/dev/null 2>&1"
+kubectl -n "$CTRL_NS" scale deploy "$CTRL_DEPLOY" --replicas=1 >/dev/null
+check "after restart, its PVC and PV are swept" wait_for 120 sh -c "! kubectl -n $NS_RW get pvc stray >/dev/null 2>&1 && ! kubectl get pv $STRAY_PV >/dev/null 2>&1"
 
 step "6. the SharedFilesystem waits for its volumes"
 kubectl delete sfs "$P" --wait=false >/dev/null
@@ -171,15 +197,13 @@ step "6b. removing the grants of a SharedFilesystem being deleted still withdraw
 kubectl patch sfs "$P" --type=merge -p '{"spec":{"grants":null}}' >/dev/null
 check "claim reports NamespaceNotGranted" wait_for 30 cond_is "$NS_RW" data Accepted False/NamespaceNotGranted
 check "PVC Terminating after the grace period" wait_for $((GRACE+30)) sh -c "[ -n \"\$(kubectl -n $NS_RW get pvc data -o jsonpath='{.metadata.deletionTimestamp}')\" ]"
-check "claim names the pod that still mounts it" sh -c "kubectl -n $NS_RW get sfc data -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].message}' | grep -q 'still mounted by w'"
+check "claim names the pod that still mounts it" wait_for 30 sh -c "kubectl -n $NS_RW get sfc data -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].message}' | grep -q 'still mounted by w'"
 
-step "7. deleting a claim in use waits for its pod, then PVC, PV, claim go in order"
-kubectl -n "$NS_RW" delete sfc data --wait=false >/dev/null
-sleep 10
-check "claim waits (Deleting) while the pod runs" cond_is "$NS_RW" data Ready False/Deleting
-check "the PV is not deleted while the PVC is in use" sh -c "[ -z \"\$(kubectl get pv $RW_PV -o jsonpath='{.metadata.deletionTimestamp}')\" ]"
+step "7. once the pod stops, everything goes and the source stays"
 kubectl -n "$NS_RW" exec w -- rm -rf "$DIR" >/dev/null 2>&1
 kubectl -n "$NS_RW" delete pod w --wait=true >/dev/null
-check "claim, PVC and PV are gone" wait_for 90 sh -c "! kubectl -n $NS_RW get sfc data >/dev/null 2>&1 && ! kubectl get pv $RW_PV >/dev/null 2>&1"
+check "PVC and PV are gone" wait_for 90 sh -c "! kubectl -n $NS_RW get pvc data >/dev/null 2>&1 && ! kubectl get pv $RW_PV >/dev/null 2>&1"
+kubectl -n "$NS_RW" delete sfc data --wait=false >/dev/null
+check "the claim goes" wait_for 60 sh -c "! kubectl -n $NS_RW get sfc data >/dev/null 2>&1"
 check "the SharedFilesystem lets go by itself" wait_for 60 gone sfs "$P"
 check "the source PV is untouched" sh -c "kubectl get pv $SRC >/dev/null"

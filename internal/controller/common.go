@@ -45,6 +45,10 @@ func grantedAccess(fs *sharedfsv1alpha1.SharedFilesystem, ns *corev1.Namespace) 
 	var best sharedfsv1alpha1.Access
 	granted := false
 	for i, g := range fs.Spec.Grants {
+		if len(g.NamespaceSelector.MatchLabels) == 0 && len(g.NamespaceSelector.MatchExpressions) == 0 {
+			// The CRD forbids this; refuse it here too in case an older CRD is installed.
+			return "", false, fmt.Errorf("grants[%d].namespaceSelector is empty", i)
+		}
 		sel, err := metav1.LabelSelectorAsSelector(&g.NamespaceSelector)
 		if err != nil {
 			return "", false, fmt.Errorf("grants[%d].namespaceSelector: %w", i, err)
@@ -67,6 +71,9 @@ func grantedAccess(fs *sharedfsv1alpha1.SharedFilesystem, ns *corev1.Namespace) 
 // validateGrants reports the first grant whose selector cannot be parsed.
 func validateGrants(fs *sharedfsv1alpha1.SharedFilesystem) error {
 	for i, g := range fs.Spec.Grants {
+		if len(g.NamespaceSelector.MatchLabels) == 0 && len(g.NamespaceSelector.MatchExpressions) == 0 {
+			return fmt.Errorf("grants[%d].namespaceSelector is empty", i)
+		}
 		if _, err := metav1.LabelSelectorAsSelector(&g.NamespaceSelector); err != nil {
 			return fmt.Errorf("grants[%d].namespaceSelector: %w", i, err)
 		}

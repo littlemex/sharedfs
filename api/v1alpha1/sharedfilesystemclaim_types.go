@@ -54,8 +54,9 @@ type SharedFilesystemClaimStatus struct {
 	// +optional
 	PersistentVolumeName string `json:"persistentVolumeName,omitempty"`
 
-	// withdrawAfter is set while the claim is not granted: once it passes and the grant is still
-	// missing, the PersistentVolumeClaim is deleted. It is cleared when the grant comes back.
+	// withdrawAfter is set while the claim is not granted and still holds a volume: once it
+	// passes and the grant is still missing on a live read, the PersistentVolumeClaim is
+	// deleted. It is cleared when the grant comes back or nothing is left to withdraw.
 	// +optional
 	WithdrawAfter *metav1.Time `json:"withdrawAfter,omitempty"`
 

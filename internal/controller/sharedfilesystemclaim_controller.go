@@ -352,12 +352,20 @@ func (r *SharedFilesystemClaimReconciler) heal(ctx context.Context, claim *share
 // for another reason (an unreadable source) still gets the full grace period.
 func (r *SharedFilesystemClaimReconciler) revoke(ctx context.Context, claim *sharedfsv1alpha1.SharedFilesystemClaim) (ctrl.Result, withdrawal, error) {
 	var w withdrawal
-	if !r.holdsVolumes(ctx, claim) {
-		// Nothing to withdraw: no live reads for a claim that never got anything.
+	holds, err := r.holdsVolumes(ctx, claim)
+	if err != nil {
+		return ctrl.Result{}, w, err
+	}
+	if !holds {
+		// Nothing (left) to withdraw: no live reads for a claim that holds nothing.
+		claim.Status.WithdrawAfter = nil
 		return ctrl.Result{}, w, nil
 	}
-	if claim.Status.WithdrawAfter == nil {
-		claim.Status.WithdrawAfter = &metav1.Time{Time: time.Now().Add(r.RevocationGracePeriod)}
+	// Rounded up to the second the field is stored with, and never later than one grace period
+	// from now, so a value written by someone else cannot postpone the withdrawal.
+	latest := metav1.NewTime(time.Now().Add(r.RevocationGracePeriod).Add(time.Second - 1).Truncate(time.Second))
+	if claim.Status.WithdrawAfter == nil || claim.Status.WithdrawAfter.After(latest.Time) {
+		claim.Status.WithdrawAfter = &latest
 	}
 	if wait := time.Until(claim.Status.WithdrawAfter.Time); wait > 0 {
 		w.pending = true
@@ -376,18 +384,29 @@ func (r *SharedFilesystemClaimReconciler) revoke(ctx context.Context, claim *sha
 		return ctrl.Result{}, w, err
 	}
 	w.active = true
-	w.pods, err = r.podsMounting(ctx, claim)
-	return ctrl.Result{}, w, err
+	// Only for the message: a failed list is logged, not retried.
+	if w.pods, err = r.podsMounting(ctx, claim); err != nil {
+		logf.FromContext(ctx).Error(err, "listing the pods that mount a withdrawn claim")
+	}
+	return ctrl.Result{}, w, nil
 }
 
 // holdsVolumes reports from the cache whether the claim has a PVC or a PV to withdraw.
-func (r *SharedFilesystemClaimReconciler) holdsVolumes(ctx context.Context, claim *sharedfsv1alpha1.SharedFilesystemClaim) bool {
+func (r *SharedFilesystemClaimReconciler) holdsVolumes(ctx context.Context, claim *sharedfsv1alpha1.SharedFilesystemClaim) (bool, error) {
 	var pv corev1.PersistentVolume
-	if err := r.Get(ctx, types.NamespacedName{Name: volume.PVName(claim.UID)}, &pv); err == nil {
-		return true
+	err := r.Get(ctx, types.NamespacedName{Name: volume.PVName(claim.UID)}, &pv)
+	if err == nil {
+		return true, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return false, err
 	}
 	var pvc corev1.PersistentVolumeClaim
-	return r.Get(ctx, client.ObjectKeyFromObject(claim), &pvc) == nil && volume.OwnsPVC(claim.UID, &pvc)
+	err = r.Get(ctx, client.ObjectKeyFromObject(claim), &pvc)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	return err == nil && volume.OwnsPVC(claim.UID, &pvc), client.IgnoreNotFound(err)
 }
 
 // podsMounting names the pods that keep a withdrawn PVC alive. It reads live, and only while a
@@ -397,14 +416,23 @@ func (r *SharedFilesystemClaimReconciler) podsMounting(ctx context.Context, clai
 	if err := r.APIReader.List(ctx, &pods, client.InNamespace(claim.Namespace)); err != nil {
 		return nil, err
 	}
+	const show = 5
 	var names []string
+	more := 0
 	for _, p := range pods.Items {
 		for _, v := range p.Spec.Volumes {
 			if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claim.Name {
-				names = append(names, p.Name)
+				if len(names) < show {
+					names = append(names, p.Name)
+				} else {
+					more++
+				}
 				break
 			}
 		}
+	}
+	if more > 0 {
+		names = append(names, fmt.Sprintf("and %d more", more))
 	}
 	return names, nil
 }
@@ -465,6 +493,8 @@ func (r *SharedFilesystemClaimReconciler) observeBinding(ctx context.Context, cl
 		setCondition(&claim.Status.Conditions, claim.Generation, sharedfsv1alpha1.ConditionBound, status, reason, msg)
 	}
 	switch {
+	case e.applyErr != nil && (pvc == nil || volume.OwnsPVC(claim.UID, pvc)):
+		set(false, sharedfsv1alpha1.ReasonVolumeApplyFailed, e.applyErr.Error())
 	case pvc == nil && e.createErr != nil:
 		set(false, sharedfsv1alpha1.ReasonPVCCreateFailed, fmt.Sprintf("creating PersistentVolumeClaim %s: %v", claim.Name, e.createErr))
 	case pvc == nil:
@@ -479,9 +509,7 @@ func (r *SharedFilesystemClaimReconciler) observeBinding(ctx context.Context, cl
 		set(false, sharedfsv1alpha1.ReasonPVCLost, fmt.Sprintf("PersistentVolumeClaim %s lost its volume and is recreated", pvc.Name))
 	case pvExists && !pv.DeletionTimestamp.IsZero():
 		set(false, sharedfsv1alpha1.ReasonVolumeTerminating,
-			fmt.Sprintf("PersistentVolume %s is being deleted; it stays while PersistentVolumeClaim %s is bound, and is recreated once both are gone (delete the PVC or stop its pods)", pvName, pvc.Name))
-	case e.applyErr != nil:
-		set(false, sharedfsv1alpha1.ReasonVolumeApplyFailed, e.applyErr.Error())
+			fmt.Sprintf("PersistentVolume %s is being deleted; it stays while PersistentVolumeClaim %s is bound. Delete the PVC (and stop the pods that use it); both are then recreated", pvName, pvc.Name))
 	case pvc.Status.Phase == corev1.ClaimBound:
 		set(true, sharedfsv1alpha1.ReasonBound, fmt.Sprintf("PersistentVolumeClaim %s is bound to %s", pvc.Name, pvName))
 	default:
@@ -515,7 +543,7 @@ func (r *SharedFilesystemClaimReconciler) setReady(claim *sharedfsv1alpha1.Share
 	case w.active:
 		msg := accepted.Message + "; the PersistentVolumeClaim is being deleted, pods already running keep their mount until they stop"
 		if len(w.pods) > 0 {
-			msg += fmt.Sprintf(" (still mounted by %s)", strings.Join(w.pods, ", "))
+			msg += fmt.Sprintf(" (at the last check, still mounted by %s)", strings.Join(w.pods, ", "))
 		}
 		set(false, sharedfsv1alpha1.ReasonRevoking, msg)
 	case w.pending:

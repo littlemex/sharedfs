@@ -63,6 +63,10 @@ The claim reconciler reads the source PersistentVolume itself rather than the Sh
 | Driver table in code | configuration | Each row asserts a property of the driver's mount checked against its source; making it configurable invites EFS, which mounts from `volumeHandle` |
 | PVC watch maps any PVC to the claim of the same name | `Owns` (ownerReference) | A foreign PVC whose deletion should clear `PVCConflict` has no ownerReference, and tenants can remove ours |
 
+## Measured behaviour
+
+On the clusters above, a claim is Ready about 25 seconds after it is created, for both drivers. Binding a PersistentVolume reserved by `claimRef` waits for the PV controller's periodic sync of the PVC; sharedfs does not try to shorten it.
+
 ## Not in v1alpha1
 
 EFS, sub-directory mounts, adopting hand-made PVs, following source changes automatically, eviction of running pods on withdrawal, conversion and multiple versions.

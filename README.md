@@ -89,7 +89,7 @@ A SharedFilesystem has `Ready` with `Resolved`, `SourceNotFound`, `SourceNotCSI`
 
 ## Install
 
-The controller needs no cloud credentials: it reads and writes Kubernetes objects only.
+The controller needs no cloud credentials: it reads and writes Kubernetes objects only. Its ClusterRole covers PersistentVolumes, PersistentVolumeClaims, the two sharedfs kinds, namespaces (read), events, and pods (list, used only to name the pods that keep a withdrawn PVC).
 
 ```bash
 export IMG=<registry>/sharedfs-controller:<tag>
