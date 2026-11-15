@@ -121,8 +121,9 @@ func PVC(claim *sharedfsv1alpha1.SharedFilesystemClaim, src *Source) *corev1.Per
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{src.Profile.AccessMode},
-			// "" and not nil: nil lets the DefaultStorageClass admission plugin inject the
-			// cluster default, and the claim would provision a new volume instead.
+			// "" and not nil: on a cluster with a default StorageClass, nil lets the
+			// DefaultStorageClass admission plugin set that class, which then differs from the
+			// generated PV's "" and the two do not bind.
 			StorageClassName: ptr.To(""),
 			VolumeName:       PVName(claim.UID),
 			VolumeMode:       ptr.To(corev1.PersistentVolumeFilesystem),

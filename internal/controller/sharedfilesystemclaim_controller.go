@@ -61,8 +61,9 @@ type SharedFilesystemClaimReconciler struct {
 	Recorder  events.EventRecorder
 	// RevocationGracePeriod is how long a rejection that withdraws access must last before the
 	// volumes are deleted, so a label that disappears for a moment (a GitOps sync, a typo fixed
-	// seconds later) does not take a running workload's volume away. It is counted from the
-	// Accepted condition's lastTransitionTime, which has one-second resolution.
+	// seconds later) does not take a running workload's volume away. When a claim stops being
+	// granted, its deadline (now plus this period, one-second resolution) is written to
+	// status.withdrawAfter.
 	RevocationGracePeriod time.Duration
 }
 
@@ -244,16 +245,29 @@ func (r *SharedFilesystemClaimReconciler) ensure(ctx context.Context, claim *sha
 		volume.KeepCSI(desired, &pv)
 	}
 
-	// The PVC comes first: if its name is taken by someone else's PVC, no PV is reserved for it.
+	// Check the PVC name before reserving a PV for it: if someone else's PVC holds the name,
+	// no PV is reserved at all.
+	var existing corev1.PersistentVolumeClaim
+	err = r.Get(ctx, client.ObjectKeyFromObject(claim), &existing)
+	switch {
+	case apierrors.IsNotFound(err):
+	case err != nil:
+		return e, err
+	case !volume.OwnsPVC(claim.UID, &existing) || !existing.DeletionTimestamp.IsZero():
+		e.pvc = &existing
+		return e, nil
+	}
+
+	// The PV goes before the PVC is created, so the PV controller finds the reserved PV on the
+	// PVC's first sync and binds at once, instead of at its next periodic resync.
+	if err := r.Apply(ctx, desired, client.FieldOwner(volume.FieldOwner), client.ForceOwnership); err != nil {
+		e.applyErr = fmt.Errorf("applying PersistentVolume %s: %w", *desired.Name, err)
+		return e, nil
+	}
 	pvc, createErr, err := r.ensurePVC(ctx, claim, a.src)
 	e.pvc, e.createErr = pvc, createErr
 	if err != nil || createErr != nil || pvc == nil || !volume.OwnsPVC(claim.UID, pvc) || !pvc.DeletionTimestamp.IsZero() {
 		return e, err
-	}
-
-	if err := r.Apply(ctx, desired, client.FieldOwner(volume.FieldOwner), client.ForceOwnership); err != nil {
-		e.applyErr = fmt.Errorf("applying PersistentVolume %s: %w", *desired.Name, err)
-		return e, nil
 	}
 	if pv.Status.Phase == corev1.VolumeReleased {
 		if err := r.heal(ctx, claim, pvc); err != nil {
@@ -448,6 +462,10 @@ func (r *SharedFilesystemClaimReconciler) finalize(ctx context.Context, claim *s
 	}
 	if !done {
 		before := claim.DeepCopy()
+		// Bound keeps reporting facts while deletion waits, as on every other path.
+		if err := r.observeBinding(ctx, claim, ensured{}); err != nil {
+			return ctrl.Result{}, err
+		}
 		setCondition(&claim.Status.Conditions, claim.Generation, sharedfsv1alpha1.ConditionReady, metav1.ConditionFalse,
 			sharedfsv1alpha1.ReasonDeleting,
 			"deleting the PersistentVolumeClaim, then the PersistentVolume; pods that mount the PVC keep it until they stop")

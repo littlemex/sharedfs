@@ -126,7 +126,7 @@ OLD_UID=$(kubectl -n "$NS_RW" get pvc data -o jsonpath='{.metadata.uid}')
 # can keep waiting on.
 kubectl -n "$NS_RW" delete pvc data --wait=false >/dev/null
 check "a new PVC is created and Bound" wait_for 90 sh -c "pvc=\$(kubectl -n $NS_RW get pvc data -o jsonpath='{.metadata.uid}/{.status.phase}' 2>/dev/null); [ \"\${pvc%/*}\" != $OLD_UID ] && [ \"\${pvc#*/}\" = Bound ]"
-kubectl get events -n "$NS_RW" --field-selector reason=Rebinding -o custom-columns=REASON:.reason,NOTE:.note 2>/dev/null | tail -2
+kubectl get events -n "$NS_RW" --field-selector reason=Rebinding -o custom-columns=REASON:.reason,MESSAGE:.message 2>/dev/null | tail -2
 pod "$NS_RW" w data
 check "the nonce is still there" wait_for 120 sh -c "[ \"\$(kubectl -n $NS_RW exec w -- cat $DIR/nonce 2>/dev/null)\" = $NONCE ]"
 
