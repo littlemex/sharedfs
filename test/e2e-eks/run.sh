@@ -182,9 +182,12 @@ kubectl -n "$CTRL_NS" scale deploy "$CTRL_DEPLOY" --replicas=0 >/dev/null
 kubectl -n "$CTRL_NS" wait --for=delete pod -l control-plane=controller-manager --timeout=120s >/dev/null 2>&1
 kubectl -n "$NS_RW" delete sfc stray --wait=false >/dev/null
 kubectl -n "$NS_RW" patch sfc stray --type=merge -p '{"metadata":{"finalizers":null}}' >/dev/null
-check "the claim is gone and its PVC and PV are still there" sh -c "! kubectl -n $NS_RW get sfc stray >/dev/null 2>&1 && kubectl -n $NS_RW get pvc stray >/dev/null 2>&1 && kubectl get pv $STRAY_PV >/dev/null 2>&1"
+# The PVC may already be gone: the garbage collector follows its ownerReference to the claim.
+# The PV is cluster-scoped and has no owner, so only sharedfs can remove it.
+check "the claim is gone and its PV is still there" sh -c "! kubectl -n $NS_RW get sfc stray >/dev/null 2>&1 && kubectl get pv $STRAY_PV >/dev/null 2>&1"
+echo "PVC while the controller is down: $(kubectl -n "$NS_RW" get pvc stray -o jsonpath='{.metadata.name}' 2>/dev/null || true)(empty = removed by the garbage collector)"
 kubectl -n "$CTRL_NS" scale deploy "$CTRL_DEPLOY" --replicas=1 >/dev/null
-check "after restart, its PVC and PV are swept" wait_for 120 sh -c "! kubectl -n $NS_RW get pvc stray >/dev/null 2>&1 && ! kubectl get pv $STRAY_PV >/dev/null 2>&1"
+check "after restart, the PV (and PVC, if left) is swept" wait_for 120 sh -c "! kubectl -n $NS_RW get pvc stray >/dev/null 2>&1 && ! kubectl get pv $STRAY_PV >/dev/null 2>&1"
 
 step "6. the SharedFilesystem waits for its volumes"
 kubectl delete sfs "$P" --wait=false >/dev/null

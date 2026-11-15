@@ -77,6 +77,9 @@ type SharedFilesystemClaimReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=list
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
+// pvSettleDelay is how long the PVC waits after its PV is first created.
+const pvSettleDelay = time.Second
+
 // admission is the decision on whether a claim may mount now.
 type admission struct {
 	reason  string
@@ -126,6 +129,7 @@ func (r *SharedFilesystemClaimReconciler) Reconcile(ctx context.Context, req ctr
 	switch {
 	case a.accepted():
 		e, err = r.ensure(ctx, &claim, a)
+		result.RequeueAfter = e.requeueAfter
 	case a.revoke:
 		result, w, err = r.revoke(ctx, &claim)
 	}
@@ -149,6 +153,8 @@ type ensured struct {
 	applyErr  error
 	// sourceChanged is set when the source's CSI fields differ from the existing PV's.
 	sourceChanged bool
+	// requeueAfter is set when the PVC is held back for the PV to reach the PV controller.
+	requeueAfter time.Duration
 }
 
 // withdrawal describes a revocation in progress.
@@ -227,8 +233,9 @@ func (r *SharedFilesystemClaimReconciler) ensure(ctx context.Context, claim *sha
 
 	var pv corev1.PersistentVolume
 	err := r.Get(ctx, types.NamespacedName{Name: volume.PVName(claim.UID)}, &pv)
+	pvIsNew := apierrors.IsNotFound(err)
 	switch {
-	case apierrors.IsNotFound(err):
+	case pvIsNew:
 	case err != nil:
 		return e, err
 	case !pv.DeletionTimestamp.IsZero():
@@ -262,6 +269,12 @@ func (r *SharedFilesystemClaimReconciler) ensure(ctx context.Context, claim *sha
 	// PVC's first sync and binds at once, instead of at its next periodic resync.
 	if err := r.Apply(ctx, desired, client.FieldOwner(volume.FieldOwner), client.ForceOwnership); err != nil {
 		e.applyErr = fmt.Errorf("applying PersistentVolume %s: %w", *desired.Name, err)
+		return e, nil
+	}
+	if pvIsNew && apierrors.IsNotFound(r.Get(ctx, client.ObjectKeyFromObject(claim), &existing)) {
+		// A PVC created in the same instant can reach the PV controller before the PV does,
+		// and then waits for its periodic resync. Give the PV a moment to arrive first.
+		e.requeueAfter = pvSettleDelay
 		return e, nil
 	}
 	pvc, createErr, err := r.ensurePVC(ctx, claim, a.src)
