@@ -18,13 +18,13 @@ import (
 	"github.com/littlemex/sharedfs/internal/volume"
 )
 
-// OrphanReconciler removes generated PersistentVolumes whose claim no longer exists.
+// OrphanReconciler removes generated volumes whose claim no longer exists.
 //
 // The claim's finalizer normally does this. It cannot when the finalizer was removed by hand or
 // the claim came back from a backup with a new UID. Such a PV still reserves a namespace and PVC
-// name with no UID, so a namespace recreated later under the same name would bind it without
-// ever being allowed by a SharedFilesystem. Keyed on the PV, this reconciler also sweeps every
-// leftover once at startup, when the cache first lists all PVs.
+// name with no UID, so a namespace recreated later under that name would bind it without any
+// grant. Keyed on the PV, this reconciler also sweeps every leftover once at startup, when the
+// cache first lists all PVs.
 type OrphanReconciler struct {
 	client.Client
 	// APIReader confirms a claim is gone without trusting a cache that may not have seen it yet.
@@ -32,13 +32,16 @@ type OrphanReconciler struct {
 }
 
 func (r *OrphanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	var pv corev1.PersistentVolume
 	if err := r.Get(ctx, req.NamespacedName, &pv); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	key, uid, ok := claimOfPV(&pv)
+	// The claim UID is read from the PV name, which only cluster admins can change.
+	uid, ok := volume.ClaimUIDOf(pv.Name)
+	if !ok || !volume.IsGenerated(&pv) {
+		return ctrl.Result{}, nil
+	}
+	key, ok := claimRefOf(&pv)
 	if !ok {
 		return ctrl.Result{}, nil
 	}
@@ -51,53 +54,37 @@ func (r *OrphanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if err != nil && !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, err
 	}
-
-	// The claim is gone (or is a different claim of the same name). PVC first, then the PV.
-	if pvcKey, ok := pvcOf(&pv); ok {
-		var pvc corev1.PersistentVolumeClaim
-		err := r.APIReader.Get(ctx, pvcKey, &pvc)
-		if err != nil && !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, err
-		}
-		if err == nil && volume.OwnsPVC(uid, &pvc) {
-			if pvc.DeletionTimestamp.IsZero() {
-				log.Info("deleting PVC of a claim that no longer exists", "pvc", pvcKey, "claimUID", uid)
-				if err := r.Delete(ctx, &pvc); client.IgnoreNotFound(err) != nil {
-					return ctrl.Result{}, err
-				}
-			}
-			// This reconciler watches PVs only, and the PVC's disappearance is not guaranteed to
-			// change the PV, so come back for the PV rather than wait for an event.
-			return ctrl.Result{RequeueAfter: releasePollInterval}, nil
-		}
-	}
-	if pv.DeletionTimestamp.IsZero() {
-		log.Info("deleting PV of a claim that no longer exists", "pv", pv.Name, "claimUID", uid)
-		return ctrl.Result{}, client.IgnoreNotFound(r.Delete(ctx, &pv))
-	}
-	return ctrl.Result{}, nil
+	logf.FromContext(ctx).Info("releasing volumes of a claim that no longer exists", "pv", pv.Name, "pvc", key)
+	_, err = releaseVolumes(ctx, r.Client, r.APIReader, uid, key)
+	return ctrl.Result{}, err
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *OrphanReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&corev1.PersistentVolume{}, builder.WithPredicates(predicate.NewPredicateFuncs(isGenerated))).
-		// The two events that can make a PV an orphan without changing the PV itself.
-		Watches(&sharedfsv1alpha1.SharedFilesystemClaim{}, handler.EnqueueRequestsFromMapFunc(pvOfClaim)).
-		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(pvOfPVC),
-			builder.WithPredicates(predicate.NewPredicateFuncs(isGenerated))).
+		For(&corev1.PersistentVolume{}, builder.WithPredicates(predicate.NewPredicateFuncs(func(o client.Object) bool {
+			return volume.IsGenerated(o)
+		}))).
+		// The two events that can make a PV an orphan, or move its release on, without
+		// changing the PV itself: the claim going away and its PVC going away.
+		Watches(&sharedfsv1alpha1.SharedFilesystemClaim{}, handler.EnqueueRequestsFromMapFunc(pvForClaim)).
+		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(pvForPVC)).
 		Named("orphan-volume").
 		Complete(r)
 }
 
-func pvOfClaim(_ context.Context, c client.Object) []reconcile.Request {
-	return requests(types.NamespacedName{Name: volume.PVName(c.GetUID())})
+func pvForClaim(_ context.Context, c client.Object) []reconcile.Request {
+	return toRequests([]types.NamespacedName{{Name: volume.PVName(c.GetUID())}})
 }
 
-func pvOfPVC(_ context.Context, o client.Object) []reconcile.Request {
+// pvForPVC maps by volumeName, which the tenant cannot repoint, rather than by labels.
+func pvForPVC(_ context.Context, o client.Object) []reconcile.Request {
 	pvc, ok := o.(*corev1.PersistentVolumeClaim)
-	if !ok || pvc.Spec.VolumeName == "" {
+	if !ok {
 		return nil
 	}
-	return requests(types.NamespacedName{Name: pvc.Spec.VolumeName})
+	if _, ok := volume.ClaimUIDOf(pvc.Spec.VolumeName); !ok {
+		return nil
+	}
+	return toRequests([]types.NamespacedName{{Name: pvc.Spec.VolumeName}})
 }

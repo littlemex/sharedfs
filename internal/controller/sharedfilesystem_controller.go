@@ -20,12 +20,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -37,107 +40,143 @@ import (
 	"github.com/littlemex/sharedfs/internal/volume"
 )
 
-// SharedFilesystemReconciler resolves a SharedFilesystem's source and guards its deletion.
-// It writes the SharedFilesystem status only; claims read status.resolved.
+// SharedFilesystemReconciler reports whether a SharedFilesystem's source can be distributed and
+// keeps the SharedFilesystem until no generated volume points at it. It writes only the
+// SharedFilesystem's status; what to mount is decided by the claim controller from the source
+// PersistentVolume itself.
 type SharedFilesystemReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	// APIReader confirms there are no generated volumes left before the finalizer is removed.
+	APIReader client.Reader
+	Recorder  events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=sharedfilesystems,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=sharedfilesystems/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=sharedfilesystems/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 func (r *SharedFilesystemReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	var fs sharedfsv1alpha1.SharedFilesystem
 	if err := r.Get(ctx, req.NamespacedName, &fs); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	before := fs.Status.DeepCopy()
-
-	// What holds the file system is the generated PVs, not the claims: a rejected claim holds
-	// nothing and must not block the admin.
-	var pvs corev1.PersistentVolumeList
-	if err := r.List(ctx, &pvs, client.MatchingLabels{volume.LabelFilesystemUID: string(fs.UID)}); err != nil {
-		return ctrl.Result{}, err
-	}
-	var bound int32
-	for i := range pvs.Items {
-		if pvs.Items[i].Status.Phase == corev1.VolumeBound {
-			bound++
-		}
-	}
-	fs.Status.BoundClaims = bound
-
 	if !fs.DeletionTimestamp.IsZero() {
-		if len(pvs.Items) > 0 {
-			setCondition(&fs.Status.Conditions, fs.Generation, sharedfsv1alpha1.ConditionDeleting, true,
-				sharedfsv1alpha1.ReasonVolumesRemaining,
-				fmt.Sprintf("waiting for %d generated PersistentVolume(s); delete the SharedFilesystemClaims that use this filesystem", len(pvs.Items)))
-			return ctrl.Result{}, r.patchStatus(ctx, &fs, before)
-		}
-		if controllerutil.RemoveFinalizer(&fs, volume.Finalizer) {
-			log.Info("no generated volumes left, releasing filesystem")
-			return ctrl.Result{}, r.Update(ctx, &fs)
-		}
-		return ctrl.Result{}, nil
+		return r.finalize(ctx, &fs)
 	}
-
-	if controllerutil.AddFinalizer(&fs, volume.Finalizer) {
-		if err := r.Update(ctx, &fs); err != nil {
+	if !controllerutil.ContainsFinalizer(&fs, sharedfsv1alpha1.Finalizer) {
+		patch := client.MergeFrom(fs.DeepCopy())
+		controllerutil.AddFinalizer(&fs, sharedfsv1alpha1.Finalizer)
+		if err := r.Patch(ctx, &fs, patch); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 
-	r.resolve(ctx, &fs)
+	before := fs.Status.DeepCopy()
+	pvs, err := r.generatedVolumes(ctx, r.Client, &fs)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	fs.Status.Volumes = int32(len(pvs))
 	fs.Status.ObservedGeneration = fs.Generation
-	return ctrl.Result{}, r.patchStatus(ctx, &fs, before)
+
+	reason, msg, err := r.resolve(ctx, &fs)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	status := metav1.ConditionFalse
+	if reason == sharedfsv1alpha1.ReasonResolved {
+		status = metav1.ConditionTrue
+	}
+	setCondition(&fs.Status.Conditions, fs.Generation, sharedfsv1alpha1.ConditionReady, status, reason, msg)
+	return ctrl.Result{}, r.updateStatus(ctx, &fs, before)
 }
 
-// resolve reads the source PV into status. On failure the last resolved copy is kept for
-// reference, and SourceResolved=False tells claims not to use it.
-func (r *SharedFilesystemReconciler) resolve(ctx context.Context, fs *sharedfsv1alpha1.SharedFilesystem) {
-	set := func(ok bool, reason, msg string) {
-		setCondition(&fs.Status.Conditions, fs.Generation, sharedfsv1alpha1.ConditionSourceResolved, ok, reason, msg)
-		setCondition(&fs.Status.Conditions, fs.Generation, sharedfsv1alpha1.ConditionReady, ok, reason, msg)
+// resolve checks the grants and the source PersistentVolume. Transient read errors are
+// returned, to be retried, rather than written as a reason.
+func (r *SharedFilesystemReconciler) resolve(ctx context.Context, fs *sharedfsv1alpha1.SharedFilesystem) (string, string, error) {
+	if err := validateGrants(fs); err != nil {
+		return sharedfsv1alpha1.ReasonInvalidGrant, err.Error(), nil
 	}
-
-	var src corev1.PersistentVolume
-	err := r.Get(ctx, types.NamespacedName{Name: fs.Spec.Source.PersistentVolumeName}, &src)
+	var pv corev1.PersistentVolume
+	err := r.Get(ctx, types.NamespacedName{Name: fs.Spec.PersistentVolumeRef.Name}, &pv)
 	if apierrors.IsNotFound(err) {
-		set(false, sharedfsv1alpha1.ReasonSourceNotFound,
-			fmt.Sprintf("PersistentVolume %s not found", fs.Spec.Source.PersistentVolumeName))
-		return
+		return sharedfsv1alpha1.ReasonSourceNotFound, fmt.Sprintf("PersistentVolume %s not found", fs.Spec.PersistentVolumeRef.Name), nil
 	}
 	if err != nil {
-		set(false, sharedfsv1alpha1.ReasonSourceNotFound, err.Error())
-		return
+		return "", "", err
 	}
-	resolved, err := volume.Resolve(&src)
-	var se *volume.SourceError
-	if errors.As(err, &se) {
-		set(false, se.Reason, se.Message)
-		return
+	src, err := volume.Resolve(&pv)
+	if err != nil {
+		var se *volume.SourceError
+		if !errors.As(err, &se) {
+			return "", "", err
+		}
+		return se.Reason, se.Message, nil
 	}
-	fs.Status.Resolved = resolved
-	set(true, sharedfsv1alpha1.ReasonResolved,
-		fmt.Sprintf("%s on %s", resolved.VolumeHandle, resolved.Driver))
-
-	reclaimDelete := src.Spec.PersistentVolumeReclaimPolicy == corev1.PersistentVolumeReclaimDelete
-	if reclaimDelete {
-		setCondition(&fs.Status.Conditions, fs.Generation, sharedfsv1alpha1.ConditionSourceReclaimDelete, true,
-			sharedfsv1alpha1.ReasonReclaimDelete,
-			"the source PersistentVolume has reclaimPolicy Delete: deleting its PersistentVolumeClaim deletes the file system for every tenant")
-	} else {
-		setCondition(&fs.Status.Conditions, fs.Generation, sharedfsv1alpha1.ConditionSourceReclaimDelete, false,
-			sharedfsv1alpha1.ReasonReclaimRetain, "")
+	fs.Status.Resolved = src.Status()
+	msg := fmt.Sprintf("%s on %s", src.VolumeHandle, src.Profile.Name)
+	if pv.Spec.PersistentVolumeReclaimPolicy == corev1.PersistentVolumeReclaimDelete {
+		// Not a failure: generated volumes are Retain. But whoever deletes the source's own PVC
+		// deletes the file system under every tenant, so say so where the admin looks.
+		msg += reclaimDeleteWarning
+		if prev := meta.FindStatusCondition(fs.Status.Conditions, sharedfsv1alpha1.ConditionReady); prev == nil || !strings.HasSuffix(prev.Message, reclaimDeleteWarning) {
+			r.Recorder.Eventf(fs, &pv, corev1.EventTypeWarning, "SourceReclaimDelete", "Resolve",
+				"PersistentVolume %s has reclaimPolicy Delete: deleting its PersistentVolumeClaim deletes the file system for every tenant", pv.Name)
+		}
 	}
+	return sharedfsv1alpha1.ReasonResolved, msg, nil
 }
 
-func (r *SharedFilesystemReconciler) patchStatus(ctx context.Context, fs *sharedfsv1alpha1.SharedFilesystem, before *sharedfsv1alpha1.SharedFilesystemStatus) error {
+const reclaimDeleteWarning = "; warning: the source PersistentVolume has reclaimPolicy Delete"
+
+// finalize keeps the SharedFilesystem while any generated volume points at it.
+func (r *SharedFilesystemReconciler) finalize(ctx context.Context, fs *sharedfsv1alpha1.SharedFilesystem) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(fs, sharedfsv1alpha1.Finalizer) {
+		return ctrl.Result{}, nil
+	}
+	// Live: a volume created a moment ago may not be in the cache, and removing the finalizer
+	// would leave it with no filesystem to answer to.
+	pvs, err := r.generatedVolumes(ctx, r.APIReader, fs)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if len(pvs) > 0 {
+		before := fs.Status.DeepCopy()
+		fs.Status.Volumes = int32(len(pvs))
+		setCondition(&fs.Status.Conditions, fs.Generation, sharedfsv1alpha1.ConditionReady, metav1.ConditionFalse,
+			sharedfsv1alpha1.ReasonVolumesRemaining, remainingMessage(pvs))
+		return ctrl.Result{}, r.updateStatus(ctx, fs, before)
+	}
+	patch := client.MergeFrom(fs.DeepCopy())
+	controllerutil.RemoveFinalizer(fs, sharedfsv1alpha1.Finalizer)
+	return ctrl.Result{}, r.Patch(ctx, fs, patch)
+}
+
+func remainingMessage(pvs []corev1.PersistentVolume) string {
+	const show = 5
+	var claims []string
+	for i := range pvs {
+		if len(claims) == show {
+			claims = append(claims, "...")
+			break
+		}
+		if key, ok := claimRefOf(&pvs[i]); ok {
+			claims = append(claims, key.String())
+		}
+	}
+	return fmt.Sprintf("waiting for %d generated PersistentVolume(s) to go; delete the claims (%s) or remove their grants",
+		len(pvs), strings.Join(claims, ", "))
+}
+
+func (r *SharedFilesystemReconciler) generatedVolumes(ctx context.Context, reader client.Reader, fs *sharedfsv1alpha1.SharedFilesystem) ([]corev1.PersistentVolume, error) {
+	var pvs corev1.PersistentVolumeList
+	err := reader.List(ctx, &pvs, client.MatchingLabels{sharedfsv1alpha1.LabelFilesystemUID: string(fs.UID)})
+	return pvs.Items, err
+}
+
+func (r *SharedFilesystemReconciler) updateStatus(ctx context.Context, fs *sharedfsv1alpha1.SharedFilesystem, before *sharedfsv1alpha1.SharedFilesystemStatus) error {
 	if equality.Semantic.DeepEqual(before, &fs.Status) {
 		return nil
 	}
@@ -148,28 +187,36 @@ func (r *SharedFilesystemReconciler) patchStatus(ctx context.Context, fs *shared
 func (r *SharedFilesystemReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sharedfsv1alpha1.SharedFilesystem{}).
-		// A PV event reaches a SharedFilesystem two ways: as its source, or as a volume
-		// generated from it (bound count, deletion guard).
+		// A PV event reaches a SharedFilesystem as its source, or as a volume generated from it
+		// (the volume count and the deletion guard).
 		Watches(&corev1.PersistentVolume{}, handler.EnqueueRequestsFromMapFunc(r.filesystemsForPV)).
 		Named("sharedfilesystem").
 		Complete(r)
 }
 
-func (r *SharedFilesystemReconciler) filesystemsForPV(ctx context.Context, pv client.Object) []reconcile.Request {
-	if isGenerated(pv) {
-		if name := pv.GetAnnotations()[volume.AnnotationFilesystemName]; name != "" {
-			return requests(types.NamespacedName{Name: name})
+func (r *SharedFilesystemReconciler) filesystemsForPV(ctx context.Context, o client.Object) []reconcile.Request {
+	if volume.IsGenerated(o) {
+		if name := o.GetAnnotations()[sharedfsv1alpha1.AnnotationFilesystemName]; name != "" {
+			return toRequests([]types.NamespacedName{{Name: name}})
 		}
 		return nil
 	}
+	keys, err := filesystemsUsing(ctx, r.Client, o.GetName())
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "listing filesystems for a source", "pv", o.GetName())
+	}
+	return toRequests(keys)
+}
+
+// filesystemsUsing lists the SharedFilesystems whose source is the named PersistentVolume.
+func filesystemsUsing(ctx context.Context, c client.Reader, pvName string) ([]types.NamespacedName, error) {
 	var list sharedfsv1alpha1.SharedFilesystemList
-	if err := r.List(ctx, &list, client.MatchingFields{indexFilesystemSource: pv.GetName()}); err != nil {
-		logf.FromContext(ctx).Error(err, "listing filesystems for source", "pv", pv.GetName())
-		return nil
+	if err := c.List(ctx, &list, client.MatchingFields{indexFilesystemVolume: pvName}); err != nil {
+		return nil, err
 	}
-	out := make([]types.NamespacedName, 0, len(list.Items))
+	keys := make([]types.NamespacedName, 0, len(list.Items))
 	for _, fs := range list.Items {
-		out = append(out, types.NamespacedName{Name: fs.Name})
+		keys = append(keys, types.NamespacedName{Name: fs.Name})
 	}
-	return requests(out...)
+	return keys, nil
 }

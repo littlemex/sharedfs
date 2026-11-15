@@ -17,9 +17,9 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 // Access is the kind of mount a tenant gets.
@@ -33,66 +33,65 @@ const (
 
 // Allows reports whether a mount of kind want fits within the ceiling a.
 func (a Access) Allows(want Access) bool {
-	return a == AccessReadWrite || want == AccessReadOnly
+	return a == AccessReadWrite || want != AccessReadWrite
 }
 
-// FilesystemSource names the existing static PersistentVolume that points at the file system.
-type FilesystemSource struct {
-	// persistentVolumeName is the PersistentVolume whose CSI fields are copied into every
-	// generated PersistentVolume. It is only read; its phase (Bound, Released, Available) does
-	// not matter.
+// PersistentVolumeReference names a PersistentVolume.
+type PersistentVolumeReference struct {
+	// name of the PersistentVolume.
 	// +required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
-	PersistentVolumeName string `json:"persistentVolumeName"`
+	Name string `json:"name"`
 }
 
-// AllowedNamespaces selects the namespaces that may claim the file system.
-type AllowedNamespaces struct {
-	// selector matches namespace labels. An empty selector ({}) matches every namespace.
-	// To name namespaces one by one, match on kubernetes.io/metadata.name with the In operator.
+// Grant lets the namespaces it selects mount the file system with at most the given access.
+type Grant struct {
+	// namespaceSelector matches namespace labels. An empty selector ({}) matches every
+	// namespace. To name namespaces one by one, match kubernetes.io/metadata.name with In.
+	// Tenants must not be able to edit the labels this selector reads.
 	// +required
-	Selector metav1.LabelSelector `json:"selector"`
-}
+	NamespaceSelector metav1.LabelSelector `json:"namespaceSelector"`
 
-// SharedFilesystemSpec defines a file system that the platform admin offers to tenants.
-// +kubebuilder:validation:XValidation:rule="self.source == oldSelf.source",message="source is immutable; create a new SharedFilesystem instead"
-type SharedFilesystemSpec struct {
-	// source is the existing static PersistentVolume to distribute. Immutable.
-	// +required
-	Source FilesystemSource `json:"source"`
-
-	// allowedNamespaces selects the namespaces whose SharedFilesystemClaims are accepted.
-	// When omitted, no namespace is allowed.
-	// +optional
-	AllowedNamespaces *AllowedNamespaces `json:"allowedNamespaces,omitempty"`
-
-	// maxAccess is the strongest access a claim may ask for. To offer read-only access to some
-	// namespaces and read-write access to others, create two SharedFilesystems with the same
-	// source.
+	// access is the strongest mount the selected namespaces may ask for.
 	// +optional
 	// +kubebuilder:default=ReadOnly
-	MaxAccess Access `json:"maxAccess,omitempty"`
+	Access Access `json:"access,omitempty"`
 }
 
-// ResolvedSource is the allow-listed copy of the source PersistentVolume that generated
-// PersistentVolumes are built from.
+// SharedFilesystemSpec offers one existing file system to the namespaces its grants select.
+type SharedFilesystemSpec struct {
+	// persistentVolumeRef names the existing static PersistentVolume that points at the file
+	// system. Its CSI fields are copied into every generated PersistentVolume; the
+	// PersistentVolume itself is only read, and its phase does not matter. Immutable.
+	// +required
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="persistentVolumeRef is immutable; create a new SharedFilesystem instead"
+	PersistentVolumeRef PersistentVolumeReference `json:"persistentVolumeRef"`
+
+	// grants decide which namespaces may claim the file system. A namespace selected by
+	// several grants gets the strongest access among them. With no grants, no namespace may.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=16
+	Grants []Grant `json:"grants,omitempty"`
+}
+
+// ResolvedSource shows what generated PersistentVolumes are built from. It is informational:
+// the claim controller reads the source PersistentVolume itself.
 type ResolvedSource struct {
-	// uid of the source PersistentVolume; a change means the source was recreated.
-	UID types.UID `json:"uid"`
 	// driver is the CSI driver name.
 	Driver string `json:"driver"`
 	// volumeHandle of the source PersistentVolume.
 	VolumeHandle string `json:"volumeHandle"`
-	// volumeAttributes copied for the driver's known keys only.
+	// volumeAttributes copied for the keys the driver reads.
 	// +optional
 	VolumeAttributes map[string]string `json:"volumeAttributes,omitempty"`
-	// mountOptions of the source with any rw/ro option removed.
+	// mountOptions of the source without any rw or ro option.
 	// +optional
 	// +listType=atomic
 	MountOptions []string `json:"mountOptions,omitempty"`
-	// capacity of the source PersistentVolume, as a quantity string.
-	Capacity string `json:"capacity"`
+	// capacity of the source PersistentVolume.
+	Capacity resource.Quantity `json:"capacity"`
 }
 
 // SharedFilesystemStatus is the observed state of a SharedFilesystem.
@@ -101,17 +100,15 @@ type SharedFilesystemStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// resolved is the source as last read. Claims use it only while SourceResolved is True and
-	// observedGeneration equals metadata.generation.
+	// resolved is the source as last read successfully.
 	// +optional
 	Resolved *ResolvedSource `json:"resolved,omitempty"`
 
-	// boundClaims is the number of generated PersistentVolumes that currently point at this
-	// file system.
+	// volumes is the number of generated PersistentVolumes that point at this file system.
 	// +optional
-	BoundClaims int32 `json:"boundClaims"`
+	Volumes int32 `json:"volumes"`
 
-	// conditions: SourceResolved, Ready, SourceReclaimDelete, Deleting.
+	// conditions: Ready.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
@@ -121,15 +118,15 @@ type SharedFilesystemStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=sfs,categories=sharedfs
-// +kubebuilder:printcolumn:name="Source",type=string,JSONPath=`.spec.source.persistentVolumeName`
+// +kubebuilder:printcolumn:name="Volume",type=string,JSONPath=`.spec.persistentVolumeRef.name`
 // +kubebuilder:printcolumn:name="Driver",type=string,JSONPath=`.status.resolved.driver`
-// +kubebuilder:printcolumn:name="Max",type=string,JSONPath=`.spec.maxAccess`
-// +kubebuilder:printcolumn:name="Claims",type=integer,JSONPath=`.status.boundClaims`
+// +kubebuilder:printcolumn:name="Volumes",type=integer,JSONPath=`.status.volumes`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].reason`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// SharedFilesystem offers one existing file system (through its static PersistentVolume) to the
-// namespaces it selects. It is created by the platform admin.
+// SharedFilesystem offers one existing file system, through its static PersistentVolume, to the
+// namespaces its grants select. It is created by the platform admin.
 type SharedFilesystem struct {
 	metav1.TypeMeta `json:",inline"`
 

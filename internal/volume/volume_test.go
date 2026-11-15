@@ -12,7 +12,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	sharedfsv1alpha1 "github.com/littlemex/sharedfs/api/v1alpha1"
-	"github.com/littlemex/sharedfs/internal/driver"
 )
 
 const claimUID = types.UID("0a975dbf-1969-4108-8d3a-ef37d27cc913")
@@ -20,7 +19,7 @@ const claimUID = types.UID("0a975dbf-1969-4108-8d3a-ef37d27cc913")
 func lustreSource() *corev1.PersistentVolume {
 	return &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "fsx-training", UID: "src-uid",
+			Name:        "fsx-training",
 			Annotations: map[string]string{"pv.kubernetes.io/provisioned-by": "fsx.csi.aws.com"},
 		},
 		Spec: corev1.PersistentVolumeSpec{
@@ -40,6 +39,15 @@ func lustreSource() *corev1.PersistentVolume {
 	}
 }
 
+func resolved(t *testing.T, pv *corev1.PersistentVolume) *Source {
+	t.Helper()
+	s, err := Resolve(pv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
 func claimFor(access sharedfsv1alpha1.Access) *sharedfsv1alpha1.SharedFilesystemClaim {
 	return &sharedfsv1alpha1.SharedFilesystemClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "team-a", UID: claimUID},
@@ -47,34 +55,18 @@ func claimFor(access sharedfsv1alpha1.Access) *sharedfsv1alpha1.SharedFilesystem
 	}
 }
 
-func filesystem(t *testing.T) *sharedfsv1alpha1.SharedFilesystem {
-	t.Helper()
-	r, err := Resolve(lustreSource())
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &sharedfsv1alpha1.SharedFilesystem{
-		ObjectMeta: metav1.ObjectMeta{Name: "lustre", UID: "fs-uid"},
-		Status:     sharedfsv1alpha1.SharedFilesystemStatus{Resolved: r},
-	}
-}
+var fs = &sharedfsv1alpha1.SharedFilesystem{ObjectMeta: metav1.ObjectMeta{Name: "lustre", UID: "fs-uid"}}
 
-func TestResolveCopiesOnlyAllowListedFields(t *testing.T) {
-	r, err := Resolve(lustreSource())
-	if err != nil {
-		t.Fatal(err)
+func TestResolveCopiesOnlyWhatTheDriverReads(t *testing.T) {
+	s := resolved(t, lustreSource())
+	if len(s.VolumeAttributes) != 2 || s.VolumeAttributes["mountname"] != "abcdefgh" {
+		t.Errorf("want dnsname and mountname only, got %v", s.VolumeAttributes)
 	}
-	if _, ok := r.VolumeAttributes["storage.kubernetes.io/csiProvisionerIdentity"]; ok {
-		t.Errorf("a key the driver does not read was copied: %v", r.VolumeAttributes)
+	if !slices.Equal(s.MountOptions, []string{"flock"}) {
+		t.Errorf("rw must be stripped, got %v", s.MountOptions)
 	}
-	if len(r.VolumeAttributes) != 2 {
-		t.Errorf("want dnsname and mountname, got %v", r.VolumeAttributes)
-	}
-	if !slices.Equal(r.MountOptions, []string{"flock"}) {
-		t.Errorf("rw must be stripped from the source mount options, got %v", r.MountOptions)
-	}
-	if r.Capacity != "4800Gi" || r.UID != "src-uid" {
-		t.Errorf("capacity/uid: %+v", r)
+	if s.Capacity.String() != "4800Gi" || s.Profile.AccessMode != corev1.ReadWriteMany {
+		t.Errorf("capacity %s, mode %s", s.Capacity.String(), s.Profile.AccessMode)
 	}
 }
 
@@ -85,8 +77,9 @@ func TestResolveRejects(t *testing.T) {
 	}{
 		"not csi":     {func(pv *corev1.PersistentVolume) { pv.Spec.CSI = nil }, sharedfsv1alpha1.ReasonSourceNotCSI},
 		"efs":         {func(pv *corev1.PersistentVolume) { pv.Spec.CSI.Driver = "efs.csi.aws.com" }, sharedfsv1alpha1.ReasonUnsupportedDriver},
-		"generated":   {func(pv *corev1.PersistentVolume) { pv.Labels = map[string]string{LabelManagedBy: ManagedByValue} }, sharedfsv1alpha1.ReasonSourceIsGenerated},
-		"long handle": {func(pv *corev1.PersistentVolume) { pv.Spec.CSI.VolumeHandle = strings.Repeat("x", 90) }, sharedfsv1alpha1.ReasonInvalidSource},
+		"generated":   {func(pv *corev1.PersistentVolume) { pv.Labels = map[string]string{sharedfsv1alpha1.LabelClaimUID: "x"} }, sharedfsv1alpha1.ReasonSourceIsGenerated},
+		"long handle": {func(pv *corev1.PersistentVolume) { pv.Spec.CSI.VolumeHandle = strings.Repeat("x", MaxSourceHandleBytes+1) }, sharedfsv1alpha1.ReasonInvalidSource},
+		"no dnsname":  {func(pv *corev1.PersistentVolume) { delete(pv.Spec.CSI.VolumeAttributes, "dnsname") }, sharedfsv1alpha1.ReasonInvalidSource},
 		"no capacity": {func(pv *corev1.PersistentVolume) { pv.Spec.Capacity = nil }, sharedfsv1alpha1.ReasonInvalidSource},
 	}
 	for name, c := range cases {
@@ -102,42 +95,42 @@ func TestResolveRejects(t *testing.T) {
 	}
 }
 
-func TestPVReadOnlyAndReadWrite(t *testing.T) {
-	fs := filesystem(t)
-	p, _ := driver.Lookup("fsx.csi.aws.com")
+func TestLongestSourceHandleFitsTheCSILimit(t *testing.T) {
+	pv := lustreSource()
+	pv.Spec.CSI.VolumeHandle = strings.Repeat("x", MaxSourceHandleBytes)
+	got := *PV(claimFor(""), fs, resolved(t, pv)).Spec.CSI.VolumeHandle
+	if len(got) != maxCSIVolumeIDBytes {
+		t.Errorf("longest generated handle is %d bytes, want exactly %d", len(got), maxCSIVolumeIDBytes)
+	}
+}
+
+func TestPVAccess(t *testing.T) {
+	s := resolved(t, lustreSource())
 	for _, c := range []struct {
 		access sharedfsv1alpha1.Access
 		opts   []string
 	}{
 		{sharedfsv1alpha1.AccessReadOnly, []string{"flock", "ro"}},
 		{sharedfsv1alpha1.AccessReadWrite, []string{"flock"}},
-		{"", []string{"flock", "ro"}}, // an unset access is read-only, never read-write
+		{"", []string{"flock", "ro"}}, // unset is read-only, never read-write
 	} {
-		pv, err := PV(claimFor(c.access), fs, p)
-		if err != nil {
-			t.Fatal(err)
-		}
+		pv := PV(claimFor(c.access), fs, s)
 		if !slices.Equal(pv.Spec.MountOptions, c.opts) {
 			t.Errorf("%q: mount options %v, want %v", c.access, pv.Spec.MountOptions, c.opts)
 		}
 		if !slices.Equal(pv.Spec.AccessModes, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}) {
-			t.Errorf("%q: the FSx drivers reject ReadOnlyMany; got %v", c.access, pv.Spec.AccessModes)
+			t.Errorf("%q: access modes %v", c.access, pv.Spec.AccessModes)
 		}
 	}
 }
 
 func TestPVShape(t *testing.T) {
-	fs := filesystem(t)
-	p, _ := driver.Lookup("fsx.csi.aws.com")
-	pv, err := PV(claimFor(sharedfsv1alpha1.AccessReadOnly), fs, p)
-	if err != nil {
-		t.Fatal(err)
-	}
+	pv := PV(claimFor(sharedfsv1alpha1.AccessReadOnly), fs, resolved(t, lustreSource()))
 	if *pv.Name != "sfc-"+string(claimUID) {
 		t.Errorf("name %s", *pv.Name)
 	}
 	if got := *pv.Spec.PersistentVolumeReclaimPolicy; got != corev1.PersistentVolumeReclaimRetain {
-		t.Errorf("a source with Delete must still produce Retain, got %s", got)
+		t.Errorf("a Delete source must still produce Retain, got %s", got)
 	}
 	if *pv.Spec.CSI.VolumeHandle != "fs-0123456789abcdef0-sfc-"+string(claimUID) {
 		t.Errorf("handle %s", *pv.Spec.CSI.VolumeHandle)
@@ -147,9 +140,9 @@ func TestPVShape(t *testing.T) {
 	}
 	cr := pv.Spec.ClaimRef
 	if *cr.Namespace != "team-a" || *cr.Name != "data" || cr.UID != nil || cr.ResourceVersion != nil {
-		t.Errorf("claimRef must be namespace+name only, got %+v", cr)
+		t.Errorf("claimRef must be namespace and name only, got %+v", cr)
 	}
-	if len(pv.Annotations) != 2 || pv.Annotations["pv.kubernetes.io/provisioned-by"] != "" {
+	if _, leaked := pv.Annotations["pv.kubernetes.io/provisioned-by"]; leaked {
 		t.Errorf("source annotations leaked: %v", pv.Annotations)
 	}
 	for k, v := range pv.Labels {
@@ -159,21 +152,28 @@ func TestPVShape(t *testing.T) {
 	}
 }
 
-func TestPVCShape(t *testing.T) {
-	pvc := PVC(claimFor(sharedfsv1alpha1.AccessReadWrite))
+func TestPVCShapeAndRequest(t *testing.T) {
+	pvc := PVC(claimFor(sharedfsv1alpha1.AccessReadWrite), resolved(t, lustreSource()))
 	if pvc.Name != "data" || pvc.Namespace != "team-a" || pvc.Spec.VolumeName != PVName(claimUID) {
 		t.Errorf("identity %s/%s -> %s", pvc.Namespace, pvc.Name, pvc.Spec.VolumeName)
 	}
 	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != "" {
-		t.Errorf("storageClassName must be the empty string, not nil")
+		t.Error("storageClassName must be the empty string, not nil")
 	}
-	if q := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; q.Cmp(RequestedStorage) != 0 {
+	if q := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; q.Cmp(requestedStorage) != 0 {
 		t.Errorf("request %s", q.String())
+	}
+
+	small := lustreSource()
+	small.Spec.Capacity[corev1.ResourceStorage] = resource.MustParse("100Mi")
+	pvc = PVC(claimFor(""), resolved(t, small))
+	if q := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; q.String() != "100Mi" {
+		t.Errorf("request must not exceed a small source's capacity, got %s", q.String())
 	}
 }
 
 func TestOwnsPVCIgnoresOwnerReferences(t *testing.T) {
-	pvc := PVC(claimFor(sharedfsv1alpha1.AccessReadOnly))
+	pvc := PVC(claimFor(""), resolved(t, lustreSource()))
 	if !OwnsPVC(claimUID, pvc) {
 		t.Fatal("own PVC not recognised")
 	}
@@ -185,6 +185,17 @@ func TestOwnsPVCIgnoresOwnerReferences(t *testing.T) {
 	}
 }
 
+func TestClaimUIDRoundTrip(t *testing.T) {
+	if uid, ok := ClaimUIDOf(PVName(claimUID)); !ok || uid != claimUID {
+		t.Errorf("round trip: %s %v", uid, ok)
+	}
+	for _, name := range []string{"fsx-training", "sfc-short", "pvc-" + string(claimUID)} {
+		if _, ok := ClaimUIDOf(name); ok {
+			t.Errorf("%s is not a generated name", name)
+		}
+	}
+}
+
 func TestStaleClaimUID(t *testing.T) {
 	live := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{UID: "new"}}
 	released := &corev1.PersistentVolume{
@@ -192,12 +203,12 @@ func TestStaleClaimUID(t *testing.T) {
 		Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeReleased},
 	}
 	if !StaleClaimUID(released, live) {
-		t.Error("released PV holding an old UID must be healed")
+		t.Error("a Released PV holding an old UID is healed")
 	}
 	bound := released.DeepCopy()
 	bound.Status.Phase = corev1.VolumeBound
 	if StaleClaimUID(bound, live) {
-		t.Error("a Bound PV is never touched, even if the cached PVC disagrees")
+		t.Error("a Bound PV is never touched")
 	}
 	same := released.DeepCopy()
 	same.Spec.ClaimRef.UID = "new"
@@ -211,37 +222,29 @@ func TestStaleClaimUID(t *testing.T) {
 	}
 }
 
-func TestImmutableDrift(t *testing.T) {
-	fs := filesystem(t)
-	p, _ := driver.Lookup("fsx.csi.aws.com")
-	desired, _ := PV(claimFor(sharedfsv1alpha1.AccessReadOnly), fs, p)
+func TestCSIDriftAndKeepCSI(t *testing.T) {
+	desired := PV(claimFor(""), fs, resolved(t, lustreSource()))
 	existing := &corev1.PersistentVolume{Spec: corev1.PersistentVolumeSpec{PersistentVolumeSource: corev1.PersistentVolumeSource{
 		CSI: &corev1.CSIPersistentVolumeSource{
 			Driver: *desired.Spec.CSI.Driver, VolumeHandle: *desired.Spec.CSI.VolumeHandle,
-			VolumeAttributes: desired.Spec.CSI.VolumeAttributes,
+			VolumeAttributes: map[string]string{"dnsname": "old.example"},
 		},
 	}}}
-	if d := ImmutableDrift(existing, desired); len(d) != 0 {
-		t.Errorf("no drift expected, got %v", d)
+	if d := CSIDrift(existing, desired); !slices.Equal(d, []string{"csi.volumeAttributes"}) {
+		t.Fatalf("got %v", d)
 	}
-	existing.Spec.CSI.VolumeAttributes = map[string]string{"dnsname": "other"}
-	if d := ImmutableDrift(existing, desired); !slices.Equal(d, []string{"csi.volumeAttributes"}) {
-		t.Errorf("got %v", d)
+	KeepCSI(desired, existing)
+	if d := CSIDrift(existing, desired); len(d) != 0 {
+		t.Errorf("after KeepCSI there is nothing left to drift, got %v", d)
 	}
-}
-
-func TestVolumeHandleLimit(t *testing.T) {
-	if _, err := VolumeHandle(strings.Repeat("x", 88), claimUID); err == nil {
-		t.Error("over 128 bytes must fail")
-	}
-	if _, err := VolumeHandle(strings.Repeat("x", 87), claimUID); err != nil {
-		t.Errorf("exactly 128 bytes must pass: %v", err)
+	if !slices.Equal(desired.Spec.MountOptions, []string{"flock", "ro"}) {
+		t.Errorf("the mutable fields are still the desired ones, got %v", desired.Spec.MountOptions)
 	}
 }
 
 func TestAccessAllows(t *testing.T) {
 	ro, rw := sharedfsv1alpha1.AccessReadOnly, sharedfsv1alpha1.AccessReadWrite
-	if !ro.Allows(ro) || ro.Allows(rw) || !rw.Allows(ro) || !rw.Allows(rw) {
+	if !ro.Allows(ro) || ro.Allows(rw) || !rw.Allows(ro) || !rw.Allows(rw) || !ro.Allows("") {
 		t.Error("Allows table")
 	}
 }

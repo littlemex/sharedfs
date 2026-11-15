@@ -19,20 +19,20 @@ spec:
   scope: Cluster
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.source.persistentVolumeName
-      name: Source
+    - jsonPath: .spec.persistentVolumeRef.name
+      name: Volume
       type: string
     - jsonPath: .status.resolved.driver
       name: Driver
       type: string
-    - jsonPath: .spec.maxAccess
-      name: Max
-      type: string
-    - jsonPath: .status.boundClaims
-      name: Claims
+    - jsonPath: .status.volumes
+      name: Volumes
       type: integer
     - jsonPath: .status.conditions[?(@.type=="Ready")].status
       name: Ready
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].reason
+      name: Reason
       type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -41,8 +41,8 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          SharedFilesystem offers one existing file system (through its static PersistentVolume) to the
-          namespaces it selects. It is created by the platform admin.
+          SharedFilesystem offers one existing file system, through its static PersistentVolume, to the
+          namespaces its grants select. It is created by the platform admin.
         properties:
           apiVersion:
             description: |-
@@ -62,108 +62,106 @@ spec:
           metadata:
             type: object
           spec:
-            description: SharedFilesystemSpec defines a file system that the platform
-              admin offers to tenants.
+            description: SharedFilesystemSpec offers one existing file system to the
+              namespaces its grants select.
             properties:
-              allowedNamespaces:
+              grants:
                 description: |-
-                  allowedNamespaces selects the namespaces whose SharedFilesystemClaims are accepted.
-                  When omitted, no namespace is allowed.
-                properties:
-                  selector:
-                    description: |-
-                      selector matches namespace labels. An empty selector ({}) matches every namespace.
-                      To name namespaces one by one, match on kubernetes.io/metadata.name with the In operator.
-                    properties:
-                      matchExpressions:
-                        description: matchExpressions is a list of label selector
-                          requirements. The requirements are ANDed.
-                        items:
-                          description: |-
-                            A label selector requirement is a selector that contains values, a key, and an operator that
-                            relates the key and values.
-                          properties:
-                            key:
-                              description: key is the label key that the selector
-                                applies to.
-                              type: string
-                            operator:
-                              description: |-
-                                operator represents a key's relationship to a set of values.
-                                Valid operators are In, NotIn, Exists and DoesNotExist.
-                              type: string
-                            values:
-                              description: |-
-                                values is an array of string values. If the operator is In or NotIn,
-                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
-                                the values array must be empty. This array is replaced during a strategic
-                                merge patch.
-                              items:
+                  grants decide which namespaces may claim the file system. A namespace selected by
+                  several grants gets the strongest access among them. With no grants, no namespace may.
+                items:
+                  description: Grant lets the namespaces it selects mount the file
+                    system with at most the given access.
+                  properties:
+                    access:
+                      default: ReadOnly
+                      description: access is the strongest mount the selected namespaces
+                        may ask for.
+                      enum:
+                      - ReadOnly
+                      - ReadWrite
+                      type: string
+                    namespaceSelector:
+                      description: |-
+                        namespaceSelector matches namespace labels. An empty selector ({}) matches every
+                        namespace. To name namespaces one by one, match kubernetes.io/metadata.name with In.
+                        Tenants must not be able to edit the labels this selector reads.
+                      properties:
+                        matchExpressions:
+                          description: matchExpressions is a list of label selector
+                            requirements. The requirements are ANDed.
+                          items:
+                            description: |-
+                              A label selector requirement is a selector that contains values, a key, and an operator that
+                              relates the key and values.
+                            properties:
+                              key:
+                                description: key is the label key that the selector
+                                  applies to.
                                 type: string
-                              type: array
-                              x-kubernetes-list-type: atomic
-                          required:
-                          - key
-                          - operator
+                              operator:
+                                description: |-
+                                  operator represents a key's relationship to a set of values.
+                                  Valid operators are In, NotIn, Exists and DoesNotExist.
+                                type: string
+                              values:
+                                description: |-
+                                  values is an array of string values. If the operator is In or NotIn,
+                                  the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                  the values array must be empty. This array is replaced during a strategic
+                                  merge patch.
+                                items:
+                                  type: string
+                                type: array
+                                x-kubernetes-list-type: atomic
+                            required:
+                            - key
+                            - operator
+                            type: object
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        matchLabels:
+                          additionalProperties:
+                            type: string
+                          description: |-
+                            matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                            map is equivalent to an element of matchExpressions, whose key field is "key", the
+                            operator is "In", and the values array contains only "value". The requirements are ANDed.
                           type: object
-                        type: array
-                        x-kubernetes-list-type: atomic
-                      matchLabels:
-                        additionalProperties:
-                          type: string
-                        description: |-
-                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
-                          map is equivalent to an element of matchExpressions, whose key field is "key", the
-                          operator is "In", and the values array contains only "value". The requirements are ANDed.
-                        type: object
-                    type: object
-                    x-kubernetes-map-type: atomic
-                required:
-                - selector
-                type: object
-              maxAccess:
-                default: ReadOnly
+                      type: object
+                      x-kubernetes-map-type: atomic
+                  required:
+                  - namespaceSelector
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-type: atomic
+              persistentVolumeRef:
                 description: |-
-                  maxAccess is the strongest access a claim may ask for. To offer read-only access to some
-                  namespaces and read-write access to others, create two SharedFilesystems with the same
-                  source.
-                enum:
-                - ReadOnly
-                - ReadWrite
-                type: string
-              source:
-                description: source is the existing static PersistentVolume to distribute.
-                  Immutable.
+                  persistentVolumeRef names the existing static PersistentVolume that points at the file
+                  system. Its CSI fields are copied into every generated PersistentVolume; the
+                  PersistentVolume itself is only read, and its phase does not matter. Immutable.
                 properties:
-                  persistentVolumeName:
-                    description: |-
-                      persistentVolumeName is the PersistentVolume whose CSI fields are copied into every
-                      generated PersistentVolume. It is only read; its phase (Bound, Released, Available) does
-                      not matter.
+                  name:
+                    description: name of the PersistentVolume.
                     maxLength: 253
                     minLength: 1
                     type: string
                 required:
-                - persistentVolumeName
+                - name
                 type: object
+                x-kubernetes-validations:
+                - message: persistentVolumeRef is immutable; create a new SharedFilesystem
+                    instead
+                  rule: self == oldSelf
             required:
-            - source
+            - persistentVolumeRef
             type: object
-            x-kubernetes-validations:
-            - message: source is immutable; create a new SharedFilesystem instead
-              rule: self.source == oldSelf.source
           status:
             description: SharedFilesystemStatus is the observed state of a SharedFilesystem.
             properties:
-              boundClaims:
-                description: |-
-                  boundClaims is the number of generated PersistentVolumes that currently point at this
-                  file system.
-                format: int32
-                type: integer
               conditions:
-                description: 'conditions: SourceResolved, Ready, SourceReclaimDelete,
-                  Deleting.'
+                description: 'conditions: Ready.'
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -228,33 +226,28 @@ spec:
                 format: int64
                 type: integer
               resolved:
-                description: |-
-                  resolved is the source as last read. Claims use it only while SourceResolved is True and
-                  observedGeneration equals metadata.generation.
+                description: resolved is the source as last read successfully.
                 properties:
                   capacity:
-                    description: capacity of the source PersistentVolume, as a quantity
-                      string.
-                    type: string
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: capacity of the source PersistentVolume.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
                   driver:
                     description: driver is the CSI driver name.
                     type: string
                   mountOptions:
-                    description: mountOptions of the source with any rw/ro option
-                      removed.
+                    description: mountOptions of the source without any rw or ro option.
                     items:
                       type: string
                     type: array
                     x-kubernetes-list-type: atomic
-                  uid:
-                    description: uid of the source PersistentVolume; a change means
-                      the source was recreated.
-                    type: string
                   volumeAttributes:
                     additionalProperties:
                       type: string
-                    description: volumeAttributes copied for the driver's known keys
-                      only.
+                    description: volumeAttributes copied for the keys the driver reads.
                     type: object
                   volumeHandle:
                     description: volumeHandle of the source PersistentVolume.
@@ -262,9 +255,13 @@ spec:
                 required:
                 - capacity
                 - driver
-                - uid
                 - volumeHandle
                 type: object
+              volumes:
+                description: volumes is the number of generated PersistentVolumes
+                  that point at this file system.
+                format: int32
+                type: integer
             type: object
         required:
         - spec

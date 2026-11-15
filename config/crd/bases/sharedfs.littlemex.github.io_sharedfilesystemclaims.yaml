@@ -25,8 +25,9 @@ spec:
     - jsonPath: .spec.access
       name: Access
       type: string
-    - jsonPath: .status.persistentVolumeClaimName
-      name: PVC
+    - jsonPath: .status.persistentVolumeName
+      name: Volume
+      priority: 1
       type: string
     - jsonPath: .status.conditions[?(@.type=="Ready")].status
       name: Ready
@@ -43,8 +44,8 @@ spec:
       openAPIV3Schema:
         description: |-
           SharedFilesystemClaim asks for the SharedFilesystem it names to be mountable in this
-          namespace. The controller creates a PersistentVolumeClaim of the same name. It is created by
-          the tenant.
+          namespace. Pods mount the PersistentVolumeClaim that the controller creates with the claim's
+          own name. It is created by the tenant.
         properties:
           apiVersion:
             description: |-
@@ -160,11 +161,6 @@ spec:
                   computed from.
                 format: int64
                 type: integer
-              persistentVolumeClaimName:
-                description: |-
-                  persistentVolumeClaimName is the PersistentVolumeClaim to mount from pods. It carries the
-                  claim's own name.
-                type: string
               persistentVolumeName:
                 description: persistentVolumeName is the generated PersistentVolume.
                 type: string

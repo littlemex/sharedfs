@@ -99,10 +99,12 @@ var _ = BeforeSuite(func() {
 	})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(SetupIndexes(ctx, mgr)).To(Succeed())
-	Expect((&SharedFilesystemReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr)).To(Succeed())
+	Expect((&SharedFilesystemReconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: mgr.GetEventRecorder("sharedfs"),
+	}).SetupWithManager(mgr)).To(Succeed())
 	Expect((&SharedFilesystemClaimReconciler{
 		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorder("sharedfs"),
+		Recorder: mgr.GetEventRecorder("sharedfs"), RevocationGracePeriod: gracePeriod,
 	}).SetupWithManager(mgr)).To(Succeed())
 	Expect((&OrphanReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()}).SetupWithManager(mgr)).To(Succeed())
 	go func() {

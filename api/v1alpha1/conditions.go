@@ -16,30 +16,21 @@ limitations under the License.
 
 package v1alpha1
 
-// Condition types and reasons are part of the API: tools and people match on them.
+// Condition types and reasons are part of the API: tools and people match on them. Every reason
+// names one cause.
 const (
-	// ConditionReady is set on both kinds.
+	// ConditionReady is set on both kinds. On a SharedFilesystem it means the source resolves
+	// and claims can be accepted. On a claim it means Accepted and Bound and nothing pending.
 	ConditionReady = "Ready"
-
-	// SharedFilesystem conditions.
-
-	// ConditionSourceResolved is True when status.resolved reflects the source PersistentVolume.
-	ConditionSourceResolved = "SourceResolved"
-	// ConditionSourceReclaimDelete is True when the source PersistentVolume has reclaimPolicy
-	// Delete: deleting the source's own PVC would delete the file system. Generated volumes are
-	// Retain regardless. It is a warning and does not make the filesystem unusable.
-	ConditionSourceReclaimDelete = "SourceReclaimDelete"
-	// ConditionDeleting is True while deletion waits for generated volumes to go away.
-	ConditionDeleting = "Deleting"
-
-	// SharedFilesystemClaim conditions.
-
-	// ConditionAccepted is True when the claim is allowed to mount the filesystem.
+	// ConditionAccepted is set on claims: the namespace is granted the requested access, and
+	// the filesystem and its source can be used.
 	ConditionAccepted = "Accepted"
-	// ConditionBound mirrors whether the generated PersistentVolumeClaim is Bound.
+	// ConditionBound is set on claims and reports facts about the generated PVC and PV,
+	// whether or not the claim is currently accepted.
 	ConditionBound = "Bound"
 )
 
+// Reasons of SharedFilesystem Ready.
 const (
 	ReasonResolved          = "Resolved"
 	ReasonSourceNotFound    = "SourceNotFound"
@@ -47,28 +38,50 @@ const (
 	ReasonUnsupportedDriver = "UnsupportedDriver"
 	ReasonSourceIsGenerated = "SourceIsGenerated"
 	ReasonInvalidSource     = "InvalidSource"
-	ReasonReclaimDelete     = "ReclaimPolicyDelete"
-	ReasonReclaimRetain     = "ReclaimPolicyRetain"
+	ReasonInvalidGrant      = "InvalidGrant"
 	ReasonVolumesRemaining  = "VolumesRemaining"
-
-	ReasonAccepted            = "Accepted"
-	ReasonFilesystemNotFound  = "FilesystemNotFound"
-	ReasonFilesystemNotReady  = "FilesystemNotReady"
-	ReasonFilesystemDeleting  = "FilesystemDeleting"
-	ReasonNamespaceNotAllowed = "NamespaceNotAllowed"
-	ReasonAccessNotAllowed    = "AccessNotAllowed"
-	ReasonPVCConflict         = "PVCConflict"
-	ReasonSourceChanged       = "SourceChanged"
-	ReasonBound               = "Bound"
-	ReasonPending             = "Pending"
-	ReasonPVCTerminating      = "PVCTerminating"
-	ReasonReady               = "Ready"
-	ReasonDeleting            = "Deleting"
 )
 
-// Revokes reports whether a rejection reason withdraws access: the generated PVC and PV are
-// deleted. Every other rejection is treated as possibly temporary and leaves them in place, so a
-// source PV that is briefly unreadable does not take every tenant's volume away.
-func Revokes(reason string) bool {
-	return reason == ReasonNamespaceNotAllowed || reason == ReasonAccessNotAllowed
-}
+// Reasons of claim Accepted. The first three withdraw access when they persist past the
+// revocation grace period; the others leave existing volumes in place.
+const (
+	ReasonAccepted            = "Accepted"
+	ReasonNamespaceNotGranted = "NamespaceNotGranted"
+	ReasonAccessNotGranted    = "AccessNotGranted"
+	ReasonFilesystemNotFound  = "FilesystemNotFound"
+	ReasonFilesystemDeleting  = "FilesystemDeleting"
+	ReasonFilesystemNotReady  = "FilesystemNotReady"
+)
+
+// Reasons of claim Bound.
+const (
+	ReasonBound            = "Bound"
+	ReasonNoVolume         = "NoVolume"
+	ReasonPVCPending       = "PVCPending"
+	ReasonPVCConflict      = "PVCConflict"
+	ReasonPVCTerminating   = "PVCTerminating"
+	ReasonPVCLost          = "PVCLost"
+	ReasonPVCCreateFailed  = "PVCCreateFailed"
+	ReasonVolumeTerminating = "VolumeTerminating"
+)
+
+// Reasons of claim Ready besides the ones it copies from Accepted and Bound.
+const (
+	ReasonReady         = "Ready"
+	ReasonRevoking      = "Revoking"
+	ReasonSourceChanged = "SourceChanged"
+	ReasonDeleting      = "Deleting"
+)
+
+// Names sharedfs puts on the objects it manages.
+const (
+	// Finalizer is set on both kinds.
+	Finalizer = "sharedfs.littlemex.github.io/cleanup"
+	// LabelClaimUID marks a generated PersistentVolume or PersistentVolumeClaim with the UID of
+	// its claim. Labels carry UIDs only: names can be longer than a label value allows.
+	LabelClaimUID = "sharedfs.littlemex.github.io/claim-uid"
+	// LabelFilesystemUID marks a generated PersistentVolume with the UID of its SharedFilesystem.
+	LabelFilesystemUID = "sharedfs.littlemex.github.io/filesystem-uid"
+	// AnnotationFilesystemName names the SharedFilesystem of a generated PersistentVolume.
+	AnnotationFilesystemName = "sharedfs.littlemex.github.io/filesystem-name"
+)

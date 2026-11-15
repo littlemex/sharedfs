@@ -50,11 +50,6 @@ type SharedFilesystemClaimStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// persistentVolumeClaimName is the PersistentVolumeClaim to mount from pods. It carries the
-	// claim's own name.
-	// +optional
-	PersistentVolumeClaimName string `json:"persistentVolumeClaimName,omitempty"`
-
 	// persistentVolumeName is the generated PersistentVolume.
 	// +optional
 	PersistentVolumeName string `json:"persistentVolumeName,omitempty"`
@@ -71,14 +66,14 @@ type SharedFilesystemClaimStatus struct {
 // +kubebuilder:resource:shortName=sfc,categories=sharedfs
 // +kubebuilder:printcolumn:name="Filesystem",type=string,JSONPath=`.spec.filesystemRef.name`
 // +kubebuilder:printcolumn:name="Access",type=string,JSONPath=`.spec.access`
-// +kubebuilder:printcolumn:name="PVC",type=string,JSONPath=`.status.persistentVolumeClaimName`
+// +kubebuilder:printcolumn:name="Volume",type=string,JSONPath=`.status.persistentVolumeName`,priority=1
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].reason`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // SharedFilesystemClaim asks for the SharedFilesystem it names to be mountable in this
-// namespace. The controller creates a PersistentVolumeClaim of the same name. It is created by
-// the tenant.
+// namespace. Pods mount the PersistentVolumeClaim that the controller creates with the claim's
+// own name. It is created by the tenant.
 type SharedFilesystemClaim struct {
 	metav1.TypeMeta `json:",inline"`
 
