@@ -75,10 +75,12 @@ func TestResolveRejects(t *testing.T) {
 		mutate func(*corev1.PersistentVolume)
 		reason string
 	}{
-		"not csi":     {func(pv *corev1.PersistentVolume) { pv.Spec.CSI = nil }, sharedfsv1alpha1.ReasonSourceNotCSI},
-		"efs":         {func(pv *corev1.PersistentVolume) { pv.Spec.CSI.Driver = "efs.csi.aws.com" }, sharedfsv1alpha1.ReasonUnsupportedDriver},
-		"generated":   {func(pv *corev1.PersistentVolume) { pv.Labels = map[string]string{sharedfsv1alpha1.LabelClaimUID: "x"} }, sharedfsv1alpha1.ReasonSourceIsGenerated},
-		"long handle": {func(pv *corev1.PersistentVolume) { pv.Spec.CSI.VolumeHandle = strings.Repeat("x", MaxSourceHandleBytes+1) }, sharedfsv1alpha1.ReasonInvalidSource},
+		"not csi":   {func(pv *corev1.PersistentVolume) { pv.Spec.CSI = nil }, sharedfsv1alpha1.ReasonSourceNotCSI},
+		"efs":       {func(pv *corev1.PersistentVolume) { pv.Spec.CSI.Driver = "efs.csi.aws.com" }, sharedfsv1alpha1.ReasonUnsupportedDriver},
+		"generated": {func(pv *corev1.PersistentVolume) { pv.Labels = map[string]string{sharedfsv1alpha1.LabelClaimUID: "x"} }, sharedfsv1alpha1.ReasonSourceIsGenerated},
+		"long handle": {func(pv *corev1.PersistentVolume) {
+			pv.Spec.CSI.VolumeHandle = strings.Repeat("x", MaxSourceHandleBytes+1)
+		}, sharedfsv1alpha1.ReasonInvalidSource},
 		"no dnsname":  {func(pv *corev1.PersistentVolume) { delete(pv.Spec.CSI.VolumeAttributes, "dnsname") }, sharedfsv1alpha1.ReasonInvalidSource},
 		"no capacity": {func(pv *corev1.PersistentVolume) { pv.Spec.Capacity = nil }, sharedfsv1alpha1.ReasonInvalidSource},
 	}

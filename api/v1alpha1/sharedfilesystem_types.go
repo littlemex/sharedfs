@@ -46,10 +46,13 @@ type PersistentVolumeReference struct {
 }
 
 // Grant lets the namespaces it selects mount the file system with at most the given access.
+// +kubebuilder:validation:XValidation:rule="(has(self.namespaceSelector.matchLabels) && size(self.namespaceSelector.matchLabels) > 0) || (has(self.namespaceSelector.matchExpressions) && size(self.namespaceSelector.matchExpressions) > 0)",message="namespaceSelector must not be empty; to grant every namespace, match kubernetes.io/metadata.name with operator Exists"
 type Grant struct {
-	// namespaceSelector matches namespace labels. An empty selector ({}) matches every
-	// namespace. To name namespaces one by one, match kubernetes.io/metadata.name with In.
-	// Tenants must not be able to edit the labels this selector reads.
+	// namespaceSelector matches namespace labels. It must not be empty, so a selector whose
+	// fields were dropped by a typo does not grant every namespace; to grant every namespace,
+	// match kubernetes.io/metadata.name with operator Exists. To name namespaces one by one,
+	// match kubernetes.io/metadata.name with In. Tenants must not be able to edit the labels
+	// this selector reads.
 	// +required
 	NamespaceSelector metav1.LabelSelector `json:"namespaceSelector"`
 

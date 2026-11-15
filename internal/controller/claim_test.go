@@ -160,8 +160,18 @@ var _ = Describe("SharedFilesystemClaim", func() {
 		Expect(k8sClient.Delete(ctx, src)).To(Succeed())
 		Eventually(gone(src), timeout, interval).Should(BeTrue())
 		Eventually(conditionOf(c, sharedfsv1alpha1.ConditionAccepted), timeout, interval).
-			Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonFilesystemNotReady))
+			Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonSourceNotFound))
 		Consistently(notDeleting(pvcOf(c)), gracePeriod+2*time.Second, interval).Should(Succeed())
+
+		By("then losing the grant still gets the full grace period, counted from the loss")
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ns), ns)).To(Succeed())
+		delete(ns.Labels, grantKey)
+		Expect(k8sClient.Update(ctx, ns)).To(Succeed())
+		Eventually(conditionOf(c, sharedfsv1alpha1.ConditionAccepted), timeout, interval).
+			Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonNamespaceNotGranted))
+		Expect(c.Status.WithdrawAfter).NotTo(BeNil())
+		Consistently(notDeleting(pvcOf(c)), gracePeriod-1500*time.Millisecond, interval).Should(Succeed())
+		Eventually(gone(pvcOf(c)), timeout, interval).Should(BeTrue())
 	})
 
 	It("does not adopt someone else's PVC, and recovers once it is deleted", func() {

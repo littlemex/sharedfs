@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -49,8 +50,9 @@ import (
 // PersistentVolumeClaim of the claim's name, keeps the pair bound, and withdraws it when the
 // namespace is no longer granted.
 //
-// It enforces one invariant: a generated volume exists only while a SharedFilesystem exists and
-// grants its namespace the access the volume has.
+// It enforces one invariant: a new mount of a generated volume is possible only while a
+// SharedFilesystem exists and grants its namespace the access the volume has. Pods that are
+// already running keep their mount until they stop; the claim names them while it waits.
 type SharedFilesystemClaimReconciler struct {
 	client.Client
 	// APIReader reads around the cache where acting on a stale read would be unsafe.
@@ -71,6 +73,7 @@ type SharedFilesystemClaimReconciler struct {
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=list
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // admission is the decision on whether a claim may mount now.
@@ -111,28 +114,50 @@ func (r *SharedFilesystemClaimReconciler) Reconcile(ctx context.Context, req ctr
 	}
 	r.setAccepted(&claim, a)
 
+	if !a.revoke {
+		claim.Status.WithdrawAfter = nil
+	}
 	var (
-		result        ctrl.Result
-		seen          *corev1.PersistentVolumeClaim
-		createErr     error
-		sourceChanged bool
-		revoking      bool
+		result ctrl.Result
+		e      ensured
+		w      withdrawal
 	)
 	switch {
 	case a.accepted():
-		seen, createErr, sourceChanged, err = r.ensure(ctx, &claim, a)
+		e, err = r.ensure(ctx, &claim, a)
 	case a.revoke:
-		result, revoking, err = r.revoke(ctx, &claim)
+		result, w, err = r.revoke(ctx, &claim)
 	}
-	if obsErr := r.observeBinding(ctx, &claim, seen, createErr); obsErr != nil && err == nil {
+	if obsErr := r.observeBinding(ctx, &claim, e); obsErr != nil && err == nil {
 		err = obsErr
 	}
-	r.setReady(&claim, sourceChanged, revoking)
+	r.setReady(&claim, e.sourceChanged, w)
 	// Status first, so a failure is visible on the claim and not only in the controller log.
 	if statusErr := r.updateStatus(ctx, &claim, before); statusErr != nil && err == nil {
 		err = statusErr
 	}
-	return result, errors.Join(err, createErr)
+	return result, errors.Join(err, e.createErr, e.applyErr)
+}
+
+// ensured is what ensure saw and did.
+type ensured struct {
+	// pvc is the PVC ensure read or created, newer than the cache.
+	pvc *corev1.PersistentVolumeClaim
+	// createErr and applyErr are failures to show on the claim.
+	createErr error
+	applyErr  error
+	// sourceChanged is set when the source's CSI fields differ from the existing PV's.
+	sourceChanged bool
+}
+
+// withdrawal describes a revocation in progress.
+type withdrawal struct {
+	// pending is set while the grace period runs.
+	pending bool
+	// active is set once volumes are being deleted.
+	active bool
+	// pods are the pods that still mount the PVC.
+	pods []string
 }
 
 // admit decides whether the claim may mount. The rules depend on objects other than the claim
@@ -155,7 +180,7 @@ func (r *SharedFilesystemClaimReconciler) admit(ctx context.Context, reader clie
 	}
 	access, granted, err := grantedAccess(&fs, &ns)
 	if err != nil {
-		return admission{reason: sharedfsv1alpha1.ReasonFilesystemNotReady,
+		return admission{reason: sharedfsv1alpha1.ReasonInvalidGrant,
 			message: fmt.Sprintf("SharedFilesystem %s: %v", fs.Name, err)}, nil
 	}
 	if !granted {
@@ -176,7 +201,7 @@ func (r *SharedFilesystemClaimReconciler) admit(ctx context.Context, reader clie
 	var pv corev1.PersistentVolume
 	err = reader.Get(ctx, types.NamespacedName{Name: fs.Spec.PersistentVolumeRef.Name}, &pv)
 	if apierrors.IsNotFound(err) {
-		return admission{reason: sharedfsv1alpha1.ReasonFilesystemNotReady,
+		return admission{reason: sharedfsv1alpha1.ReasonSourceNotFound,
 			message: fmt.Sprintf("source PersistentVolume %s of SharedFilesystem %s not found", fs.Spec.PersistentVolumeRef.Name, fs.Name)}, nil
 	}
 	if err != nil {
@@ -185,8 +210,7 @@ func (r *SharedFilesystemClaimReconciler) admit(ctx context.Context, reader clie
 	src, err := volume.Resolve(&pv)
 	var se *volume.SourceError
 	if errors.As(err, &se) {
-		return admission{reason: sharedfsv1alpha1.ReasonFilesystemNotReady,
-			message: fmt.Sprintf("SharedFilesystem %s: %s", fs.Name, se.Message)}, nil
+		return admission{reason: se.Reason, message: fmt.Sprintf("SharedFilesystem %s: %s", fs.Name, se.Message)}, nil
 	}
 	if err != nil {
 		return admission{}, err
@@ -195,45 +219,48 @@ func (r *SharedFilesystemClaimReconciler) admit(ctx context.Context, reader clie
 		message: fmt.Sprintf("%s access to SharedFilesystem %s", claim.Spec.Access, fs.Name)}, nil
 }
 
-// ensure creates or repairs the PVC and the PV of an accepted claim. It returns the PVC it saw,
-// the error of a failed PVC creation (to show on the claim), and whether the source changed
-// under an existing PV.
-func (r *SharedFilesystemClaimReconciler) ensure(ctx context.Context, claim *sharedfsv1alpha1.SharedFilesystemClaim, a admission) (
-	pvc *corev1.PersistentVolumeClaim, createErr error, sourceChanged bool, err error) {
+// ensure creates or repairs the PVC and the PV of an accepted claim.
+func (r *SharedFilesystemClaimReconciler) ensure(ctx context.Context, claim *sharedfsv1alpha1.SharedFilesystemClaim, a admission) (ensured, error) {
+	var e ensured
 	desired := volume.PV(claim, a.fs, a.src)
 
 	var pv corev1.PersistentVolume
-	err = r.Get(ctx, types.NamespacedName{Name: volume.PVName(claim.UID)}, &pv)
+	err := r.Get(ctx, types.NamespacedName{Name: volume.PVName(claim.UID)}, &pv)
 	switch {
 	case apierrors.IsNotFound(err):
 	case err != nil:
-		return nil, nil, false, err
+		return e, err
 	case !pv.DeletionTimestamp.IsZero():
-		// Deleted by someone; apply would not bring it back. The claim reports
-		// VolumeTerminating and is reconciled again when the PV is gone.
-		return nil, nil, false, nil
+		// Deleted by someone; apply would not bring it back. observeBinding explains what
+		// it waits for.
+		return e, nil
+	case pv.Spec.CSI == nil:
+		e.applyErr = fmt.Errorf("PersistentVolume %s exists and is not a CSI volume; delete it to let sharedfs recreate it", pv.Name)
+		return e, nil
 	case len(volume.CSIDrift(&pv, desired)) > 0:
 		// The volume source of a PV cannot change. Keep the existing one so the mutable fields
 		// (the ro option, the claimRef) are still enforced, and report it.
-		sourceChanged = true
+		e.sourceChanged = true
 		volume.KeepCSI(desired, &pv)
 	}
 
 	// The PVC comes first: if its name is taken by someone else's PVC, no PV is reserved for it.
-	pvc, createErr, err = r.ensurePVC(ctx, claim, a.src)
+	pvc, createErr, err := r.ensurePVC(ctx, claim, a.src)
+	e.pvc, e.createErr = pvc, createErr
 	if err != nil || createErr != nil || pvc == nil || !volume.OwnsPVC(claim.UID, pvc) || !pvc.DeletionTimestamp.IsZero() {
-		return pvc, createErr, sourceChanged, err
+		return e, err
 	}
 
 	if err := r.Apply(ctx, desired, client.FieldOwner(volume.FieldOwner), client.ForceOwnership); err != nil {
-		return pvc, nil, sourceChanged, fmt.Errorf("applying PersistentVolume %s: %w", *desired.Name, err)
+		e.applyErr = fmt.Errorf("applying PersistentVolume %s: %w", *desired.Name, err)
+		return e, nil
 	}
 	if pv.Status.Phase == corev1.VolumeReleased {
 		if err := r.heal(ctx, claim, pvc); err != nil {
-			return pvc, nil, sourceChanged, err
+			return e, err
 		}
 	}
-	return pvc, nil, sourceChanged, nil
+	return e, nil
 }
 
 // ensurePVC creates the PVC once and afterwards only checks it. The second error is a failed
@@ -319,23 +346,67 @@ func (r *SharedFilesystemClaimReconciler) heal(ctx context.Context, claim *share
 	return nil
 }
 
-// revoke withdraws access once the rejection has lasted the grace period and still holds on a
-// live read. It reports whether volumes are being withdrawn.
-func (r *SharedFilesystemClaimReconciler) revoke(ctx context.Context, claim *sharedfsv1alpha1.SharedFilesystemClaim) (ctrl.Result, bool, error) {
-	cond := meta.FindStatusCondition(claim.Status.Conditions, sharedfsv1alpha1.ConditionAccepted)
-	if wait := r.RevocationGracePeriod - time.Since(cond.LastTransitionTime.Time); wait > 0 {
-		return ctrl.Result{RequeueAfter: wait}, false, nil
+// revoke withdraws access once the claim has been ungranted for the whole grace period and the
+// grant is still missing on a live read. The grace period starts when the claim stops being
+// granted (status.withdrawAfter), not when Accepted turned False, so a claim that was rejected
+// for another reason (an unreadable source) still gets the full grace period.
+func (r *SharedFilesystemClaimReconciler) revoke(ctx context.Context, claim *sharedfsv1alpha1.SharedFilesystemClaim) (ctrl.Result, withdrawal, error) {
+	var w withdrawal
+	if !r.holdsVolumes(ctx, claim) {
+		// Nothing to withdraw: no live reads for a claim that never got anything.
+		return ctrl.Result{}, w, nil
+	}
+	if claim.Status.WithdrawAfter == nil {
+		claim.Status.WithdrawAfter = &metav1.Time{Time: time.Now().Add(r.RevocationGracePeriod)}
+	}
+	if wait := time.Until(claim.Status.WithdrawAfter.Time); wait > 0 {
+		w.pending = true
+		return ctrl.Result{RequeueAfter: wait}, w, nil
 	}
 	live, err := r.admit(ctx, r.APIReader, claim)
 	if err != nil {
-		return ctrl.Result{}, false, err
+		return ctrl.Result{}, w, err
 	}
 	if !live.revoke {
 		// The cache was behind; the next event brings the claim back with the real state.
-		return ctrl.Result{}, false, nil
+		return ctrl.Result{}, w, nil
 	}
 	done, err := releaseVolumes(ctx, r.Client, r.APIReader, claim.UID, client.ObjectKeyFromObject(claim))
-	return ctrl.Result{}, !done, err
+	if err != nil || done {
+		return ctrl.Result{}, w, err
+	}
+	w.active = true
+	w.pods, err = r.podsMounting(ctx, claim)
+	return ctrl.Result{}, w, err
+}
+
+// holdsVolumes reports from the cache whether the claim has a PVC or a PV to withdraw.
+func (r *SharedFilesystemClaimReconciler) holdsVolumes(ctx context.Context, claim *sharedfsv1alpha1.SharedFilesystemClaim) bool {
+	var pv corev1.PersistentVolume
+	if err := r.Get(ctx, types.NamespacedName{Name: volume.PVName(claim.UID)}, &pv); err == nil {
+		return true
+	}
+	var pvc corev1.PersistentVolumeClaim
+	return r.Get(ctx, client.ObjectKeyFromObject(claim), &pvc) == nil && volume.OwnsPVC(claim.UID, &pvc)
+}
+
+// podsMounting names the pods that keep a withdrawn PVC alive. It reads live, and only while a
+// withdrawal is in progress, so the controller does not cache every pod in the cluster.
+func (r *SharedFilesystemClaimReconciler) podsMounting(ctx context.Context, claim *sharedfsv1alpha1.SharedFilesystemClaim) ([]string, error) {
+	var pods corev1.PodList
+	if err := r.APIReader.List(ctx, &pods, client.InNamespace(claim.Namespace)); err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, p := range pods.Items {
+		for _, v := range p.Spec.Volumes {
+			if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claim.Name {
+				names = append(names, p.Name)
+				break
+			}
+		}
+	}
+	return names, nil
 }
 
 // finalize releases the volumes, then lets the claim go.
@@ -352,19 +423,19 @@ func (r *SharedFilesystemClaimReconciler) finalize(ctx context.Context, claim *s
 		setCondition(&claim.Status.Conditions, claim.Generation, sharedfsv1alpha1.ConditionReady, metav1.ConditionFalse,
 			sharedfsv1alpha1.ReasonDeleting,
 			"deleting the PersistentVolumeClaim, then the PersistentVolume; pods that mount the PVC keep it until they stop")
-		return ctrl.Result{}, r.updateStatus(ctx, claim, before)
+		// The claim can finish deleting between the read and this write.
+		return ctrl.Result{}, client.IgnoreNotFound(r.updateStatus(ctx, claim, before))
 	}
 	patch := client.MergeFrom(claim.DeepCopy())
 	controllerutil.RemoveFinalizer(claim, sharedfsv1alpha1.Finalizer)
-	return ctrl.Result{}, r.Patch(ctx, claim, patch)
+	return ctrl.Result{}, client.IgnoreNotFound(r.Patch(ctx, claim, patch))
 }
 
 // observeBinding sets Bound from what exists, on every path, so it is never left over from an
 // earlier state. seen is the PVC ensure just read or created, newer than the cache.
-func (r *SharedFilesystemClaimReconciler) observeBinding(ctx context.Context, claim *sharedfsv1alpha1.SharedFilesystemClaim,
-	seen *corev1.PersistentVolumeClaim, createErr error) error {
+func (r *SharedFilesystemClaimReconciler) observeBinding(ctx context.Context, claim *sharedfsv1alpha1.SharedFilesystemClaim, e ensured) error {
 	pvName := volume.PVName(claim.UID)
-	pvc := seen
+	pvc := e.pvc
 	if pvc == nil {
 		var got corev1.PersistentVolumeClaim
 		err := r.Get(ctx, client.ObjectKeyFromObject(claim), &got)
@@ -394,8 +465,8 @@ func (r *SharedFilesystemClaimReconciler) observeBinding(ctx context.Context, cl
 		setCondition(&claim.Status.Conditions, claim.Generation, sharedfsv1alpha1.ConditionBound, status, reason, msg)
 	}
 	switch {
-	case pvc == nil && createErr != nil:
-		set(false, sharedfsv1alpha1.ReasonPVCCreateFailed, fmt.Sprintf("creating PersistentVolumeClaim %s: %v", claim.Name, createErr))
+	case pvc == nil && e.createErr != nil:
+		set(false, sharedfsv1alpha1.ReasonPVCCreateFailed, fmt.Sprintf("creating PersistentVolumeClaim %s: %v", claim.Name, e.createErr))
 	case pvc == nil:
 		set(false, sharedfsv1alpha1.ReasonNoVolume, "no PersistentVolumeClaim exists for this claim")
 	case !volume.OwnsPVC(claim.UID, pvc):
@@ -408,7 +479,9 @@ func (r *SharedFilesystemClaimReconciler) observeBinding(ctx context.Context, cl
 		set(false, sharedfsv1alpha1.ReasonPVCLost, fmt.Sprintf("PersistentVolumeClaim %s lost its volume and is recreated", pvc.Name))
 	case pvExists && !pv.DeletionTimestamp.IsZero():
 		set(false, sharedfsv1alpha1.ReasonVolumeTerminating,
-			fmt.Sprintf("PersistentVolume %s is being deleted; it is recreated once gone", pvName))
+			fmt.Sprintf("PersistentVolume %s is being deleted; it stays while PersistentVolumeClaim %s is bound, and is recreated once both are gone (delete the PVC or stop its pods)", pvName, pvc.Name))
+	case e.applyErr != nil:
+		set(false, sharedfsv1alpha1.ReasonVolumeApplyFailed, e.applyErr.Error())
 	case pvc.Status.Phase == corev1.ClaimBound:
 		set(true, sharedfsv1alpha1.ReasonBound, fmt.Sprintf("PersistentVolumeClaim %s is bound to %s", pvc.Name, pvName))
 	default:
@@ -427,7 +500,7 @@ func (r *SharedFilesystemClaimReconciler) setAccepted(claim *sharedfsv1alpha1.Sh
 
 // setReady derives Ready from Accepted and Bound and carries the cause of the first one that
 // does not hold.
-func (r *SharedFilesystemClaimReconciler) setReady(claim *sharedfsv1alpha1.SharedFilesystemClaim, sourceChanged, revoking bool) {
+func (r *SharedFilesystemClaimReconciler) setReady(claim *sharedfsv1alpha1.SharedFilesystemClaim, sourceChanged bool, w withdrawal) {
 	set := func(ok bool, reason, msg string) {
 		status := metav1.ConditionFalse
 		if ok {
@@ -435,16 +508,31 @@ func (r *SharedFilesystemClaimReconciler) setReady(claim *sharedfsv1alpha1.Share
 		}
 		setCondition(&claim.Status.Conditions, claim.Generation, sharedfsv1alpha1.ConditionReady, status, reason, msg)
 	}
+	holds := func(c *metav1.Condition) bool { return c != nil && c.Status == metav1.ConditionTrue }
 	accepted := meta.FindStatusCondition(claim.Status.Conditions, sharedfsv1alpha1.ConditionAccepted)
 	bound := meta.FindStatusCondition(claim.Status.Conditions, sharedfsv1alpha1.ConditionBound)
 	switch {
-	case revoking:
-		set(false, sharedfsv1alpha1.ReasonRevoking, accepted.Message+
-			"; the PersistentVolumeClaim is deleted, and pods already running keep their mount until they stop")
-	case accepted.Status != metav1.ConditionTrue:
-		set(false, accepted.Reason, accepted.Message)
-	case bound.Status != metav1.ConditionTrue:
-		set(false, bound.Reason, bound.Message)
+	case w.active:
+		msg := accepted.Message + "; the PersistentVolumeClaim is being deleted, pods already running keep their mount until they stop"
+		if len(w.pods) > 0 {
+			msg += fmt.Sprintf(" (still mounted by %s)", strings.Join(w.pods, ", "))
+		}
+		set(false, sharedfsv1alpha1.ReasonRevoking, msg)
+	case w.pending:
+		set(false, accepted.Reason, fmt.Sprintf("%s; access is withdrawn at %s unless granted again",
+			accepted.Message, claim.Status.WithdrawAfter.UTC().Format(time.RFC3339)))
+	case !holds(accepted):
+		reason, msg := sharedfsv1alpha1.ReasonPVCPending, "not yet admitted"
+		if accepted != nil {
+			reason, msg = accepted.Reason, accepted.Message
+		}
+		set(false, reason, msg)
+	case !holds(bound):
+		reason, msg := sharedfsv1alpha1.ReasonPVCPending, "binding not yet observed"
+		if bound != nil {
+			reason, msg = bound.Reason, bound.Message
+		}
+		set(false, reason, msg)
 	case sourceChanged:
 		set(false, sharedfsv1alpha1.ReasonSourceChanged,
 			"the source PersistentVolume's CSI fields changed and this volume keeps the old ones; recreate the claim to remount")

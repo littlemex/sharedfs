@@ -147,11 +147,11 @@ func (r *SharedFilesystemReconciler) finalize(ctx context.Context, fs *sharedfsv
 		fs.Status.Volumes = int32(len(pvs))
 		setCondition(&fs.Status.Conditions, fs.Generation, sharedfsv1alpha1.ConditionReady, metav1.ConditionFalse,
 			sharedfsv1alpha1.ReasonVolumesRemaining, remainingMessage(pvs))
-		return ctrl.Result{}, r.updateStatus(ctx, fs, before)
+		return ctrl.Result{}, client.IgnoreNotFound(r.updateStatus(ctx, fs, before))
 	}
 	patch := client.MergeFrom(fs.DeepCopy())
 	controllerutil.RemoveFinalizer(fs, sharedfsv1alpha1.Finalizer)
-	return ctrl.Result{}, r.Patch(ctx, fs, patch)
+	return ctrl.Result{}, client.IgnoreNotFound(r.Patch(ctx, fs, patch))
 }
 
 func remainingMessage(pvs []corev1.PersistentVolume) string {

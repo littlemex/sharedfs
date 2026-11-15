@@ -164,6 +164,12 @@ spec:
               persistentVolumeName:
                 description: persistentVolumeName is the generated PersistentVolume.
                 type: string
+              withdrawAfter:
+                description: |-
+                  withdrawAfter is set while the claim is not granted: once it passes and the grant is still
+                  missing, the PersistentVolumeClaim is deleted. It is cleared when the grant comes back.
+                format: date-time
+                type: string
             type: object
         required:
         - spec

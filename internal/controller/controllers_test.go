@@ -199,6 +199,13 @@ var _ = Describe("SharedFilesystem", func() {
 			Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonInvalidGrant))
 	})
 
+	It("refuses a grant with an empty namespace selector", func() {
+		fs := sharedFS("fs-"+rand.String(6), "a", sharedfsv1alpha1.Grant{Access: sharedfsv1alpha1.AccessReadWrite})
+		err := k8sClient.Create(ctx, fs)
+		Expect(apierrors.IsInvalid(err)).To(BeTrue(), fmt.Sprint(err))
+		Expect(err.Error()).To(ContainSubstring("namespaceSelector must not be empty"))
+	})
+
 	It("refuses to change the source", func() {
 		fs := sharedFS("fs-"+rand.String(6), "a")
 		Expect(k8sClient.Create(ctx, fs)).To(Succeed())

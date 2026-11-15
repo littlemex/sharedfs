@@ -2,129 +2,66 @@
 
 ## Problem
 
-A static PersistentVolume binds to exactly one PersistentVolumeClaim. FSx for Lustre and FSx for
-OpenZFS file systems are shared by nature, but their dynamic provisioners create a whole new file
-system per claim, so letting a second namespace mount an existing file system means a second static
-PV pointing at the same file system. Today this is done by hand:
+A static PersistentVolume binds to exactly one PersistentVolumeClaim. FSx for Lustre and FSx for OpenZFS are shared file systems, but their dynamic provisioners create a new file system per claim, so letting a second namespace mount an existing one means a second static PersistentVolume pointing at it. By hand that is: read `dnsname` / `mountname` / `volumeHandle` / capacity off the existing PV, render a PV and a PVC, reserve the PV with `claimRef` (an unreserved static PV can be bound by any namespace that names it in `volumeName`), and, when the PVC is deleted and recreated, clear the old claim UID that keeps the `Retain` PV `Released`.
 
-- read `dnsname` / `mountname` / `volumeHandle` / capacity off the source PV with `kubectl get -o
-  jsonpath`, render a PV and a PVC with `envsubst`, and apply them;
-- pre-bind the PV with `claimRef`, because an unbound static PV can be taken by any namespace that
-  names it in `volumeName`;
-- when the PVC is deleted and recreated, the Retain PV turns `Released`, keeps the old claim UID in
-  `claimRef`, and refuses the new PVC. A dedicated script exists to clear it.
+## Measured before the design was fixed
 
-## Measured on EKS 1.35 before writing code
+On EKS 1.35 with an FSx for Lustre (4800 GiB) and an FSx for OpenZFS (256 GiB) file system, CPU nodes only.
 
 | # | Observation | How |
 |---|---|---|
-| M1 | `fsx.csi.aws.com` and `fsx.openzfs.csi.aws.com` build the mount source from `volumeAttributes`; `volumeHandle` is only an identifier | driver source, `pkg/driver/node.go` (aws-fsx-csi-driver 5ede23e, aws-fsx-openzfs-csi-driver 93c640d) |
-| M2 | Both drivers reject `ReadOnlyMany`: `InvalidArgument ... Volume capability not supported`. Only `SINGLE_NODE_WRITER` and `MULTI_NODE_MULTI_WRITER` are accepted | real mount + `controller.go` `volumeCaps` |
-| M3 | `ReadWriteMany` + `mountOptions: [ro]` mounts read-only; a write fails with `Read-only file system`, while a rw mount of the same file system on the same node keeps writing | two pods on one c5a.xlarge node, Lustre and OpenZFS |
-| M4 | A PVC in another namespace naming a claimRef'd PV in `volumeName` stays Pending (`already bound to a different claim`) | real cluster |
-| M5 | Delete and recreate a PVC of the same name: the PV goes `Released`, the new PVC stays Pending | real cluster |
+| M1 | Both drivers build the mount source from `volumeAttributes`; `volumeHandle` is an identifier only | driver source, `pkg/driver/node.go` (aws-fsx-csi-driver 5ede23e, aws-fsx-openzfs-csi-driver 93c640d) |
+| M2 | Both drivers reject `ReadOnlyMany` (`Volume capability not supported`); they accept `SINGLE_NODE_WRITER` and `MULTI_NODE_MULTI_WRITER` only | a real mount, and `controller.go` `volumeCaps` |
+| M3 | `ReadWriteMany` with the `ro` mount option mounts read-only (`Read-only file system` on write), while a read-write mount of the same file system on the same node keeps writing | two pods on one node, both drivers |
+| M4 | A PVC in another namespace naming a reserved PV in `volumeName` stays Pending (`already bound to a different claim`) | real cluster |
+| M5 | Deleting and recreating a PVC of the same name leaves the PV `Released` and the new PVC Pending | real cluster |
 | M6 | Removing only `claimRef.uid` and `claimRef.resourceVersion` rebinds the new PVC within 5 s | real cluster |
-| M7 | A cluster-scoped object with an ownerReference to a namespaced owner is not garbage collected; the GC emits `OwnerRefInvalidNamespace` | real cluster |
+| M7 | A cluster-scoped object with an ownerReference to a namespaced owner is not garbage collected (`OwnerRefInvalidNamespace`) | real cluster |
+| M8 | Both CSIDrivers have `fsGroupPolicy: ReadWriteOnceWithFSType`, so a pod's `fsGroup` does not trigger a recursive ownership change on these `ReadWriteMany` volumes | `kubectl get csidriver` |
 
 ## API
 
-Group `sharedfs.littlemex.github.io`, version `v1alpha1`.
+Group `sharedfs.littlemex.github.io`, version `v1alpha1`. Both kinds have the `status` subresource and a finalizer `sharedfs.littlemex.github.io/cleanup`.
 
-### SharedFilesystem (cluster-scoped, owned by the platform admin)
+- **SharedFilesystem** (cluster-scoped): `spec.persistentVolumeRef` (immutable, CEL `self == oldSelf`) and `spec.grants[]` of `{namespaceSelector, access}`. A namespace selected by several grants gets the strongest access; no grants means no namespace. Status: `resolved` (informational copy of the source), `volumes` (generated PVs pointing at it), `Ready`.
+- **SharedFilesystemClaim** (namespaced): `spec.filesystemRef` and `spec.access` (default `ReadOnly`); the whole spec is immutable. Status: `persistentVolumeName`, `Accepted`, `Bound`, `Ready`.
 
-```yaml
-spec:
-  source:
-    persistentVolumeName: fsx-training   # immutable (CEL self == oldSelf)
-  allowedNamespaces:
-    selector: {matchLabels: {sharedfs.littlemex.github.io/fsx-training: "rw"}}  # nil = no namespace
-  maxAccess: ReadOnly | ReadWrite        # default ReadOnly
-status:
-  observedGeneration: 1
-  resolved:                              # allow-listed fields copied from the source PV
-    driver: fsx.csi.aws.com
-    volumeHandle: fs-...
-    volumeAttributes: {dnsname: ..., mountname: ...}
-    mountOptions: [flock]
-    capacity: 4800Gi
-  claims: 2                              # SharedFilesystemClaims currently Ready
-  conditions: [SourceResolved, Ready]
-```
+One SharedFilesystem per file system, with a list of grants, rather than one object per access level: the object is named after what it shares.
 
-### SharedFilesystemClaim (namespaced, owned by the tenant)
+## Invariant
 
-```yaml
-spec:                                    # whole spec immutable; change = delete + create
-  filesystemRef: {name: fsx-training}
-  access: ReadOnly | ReadWrite           # default ReadOnly
-status:
-  observedGeneration: 1
-  persistentVolumeName: sfc-<claim uid>
-  persistentVolumeClaimName: <claim name>
-  conditions: [Accepted, Bound, Ready]
-```
+A generated volume exists only while a SharedFilesystem exists and grants its namespace the access the volume has.
 
-The tenant mounts the PVC that carries the claim's own name.
+The claim reconciler enforces it. Every reconcile evaluates the grants first, before any lifecycle check, so a grant removed while the SharedFilesystem is being deleted still withdraws access. `NamespaceNotGranted`, `AccessNotGranted` and `FilesystemNotFound` withdraw access; every other rejection (`FilesystemDeleting`, `FilesystemNotReady`, `PVCConflict`, ...) is possibly temporary and leaves existing volumes in place, so a source PV that is briefly unreadable does not take every tenant's volume away.
 
-## Reconcile: SharedFilesystemClaim
+Withdrawal is not immediate. It waits `--revocation-grace-period` (30 s) counted from the `Accepted` condition's `lastTransitionTime` (one-second resolution), then re-reads the namespace and the SharedFilesystem from the API server, bypassing the cache, and only then deletes. A label that disappears for a moment during a GitOps sync does not cost a running workload its volume, and a stale cache cannot either. Withdrawal deletes the PVC; pods already running keep their mount until they stop (pvc-protection), new pods cannot start.
 
-1. Add finalizer `sharedfs.littlemex.github.io/cleanup`.
-2. Accept or reject. Reasons for `Accepted=False`: `FilesystemNotFound`, `FilesystemNotReady`,
-   `NamespaceNotAllowed`, `AccessNotAllowed` (asked ReadWrite, maxAccess ReadOnly),
-   `PVCConflict` (a PVC with the claim's name exists and is not ours). On rejection, delete the
-   PVC and PV this claim owns (pods already running keep running through `pvc-protection`; new pods
-   cannot start).
-3. Ensure the PV `sfc-<claim uid>`: `Retain`, `storageClassName: ""`, `ReadWriteMany`, capacity and
-   CSI fields from `status.resolved`, `volumeHandle = <source handle>-sfc-<claim uid>`, mount options
-   from the source plus `ro` for ReadOnly, `claimRef: {namespace, name}` with no uid. Labels carry
-   the claim namespace / name / uid and the filesystem name. No ownerReference (M7).
-4. Ensure the PVC `<claim name>`: `volumeName` = the PV, `storageClassName: ""`, ownerReference
-   (controller=true) to the claim.
-5. Heal: if the PV's `claimRef.uid` is set and differs from the PVC's uid, remove `claimRef.uid` and
-   `claimRef.resourceVersion` (M6). Never remove the whole claimRef (it would open M4's hole).
-6. Drift on mutable PV fields (mountOptions, claimRef namespace/name, reclaim policy, labels) is
-   overwritten. A difference in immutable CSI fields means the source changed: the PV is not
-   recreated automatically; the claim reports `Ready=False (SourceChanged)`.
-7. Status: `Bound` mirrors the PVC phase; `Ready` = Accepted and Bound.
+## Reconcilers
 
-Deletion: delete the PVC, wait for it to disappear (blocked while pods use it), delete the PV, wait,
-remove the finalizer.
+| Reconciler | Keyed on | Writes | Responsibility |
+|---|---|---|---|
+| SharedFilesystem | SharedFilesystem | its status and finalizer | Report whether the source can be distributed; keep the SharedFilesystem until no generated PV points at it (counted from PVs, read live before the finalizer is removed, so a rejected claim does not block the admin) |
+| SharedFilesystemClaim | claim | PV (server-side apply), PVC (create only), claim status and finalizer | Admit, create, heal, withdraw, release on deletion |
+| Orphan | generated PV | deletes PVC and PV | Release volumes whose claim no longer exists (finalizer removed by hand, claim restored with a new UID); sweeps every PV once at startup |
 
-## Reconcile: SharedFilesystem
+The claim reconciler reads the source PersistentVolume itself rather than the SharedFilesystem status, so there is no copy between the two controllers to go stale. Releasing is one function, `releaseVolumes`, used by deletion, withdrawal and the orphan reconciler: PVC first, PV only once the PVC is gone, every read live.
 
-1. Add finalizer; while any SharedFilesystemClaim references it, deletion waits
-   (`Ready=False (ClaimsRemaining)`).
-2. Resolve the source PV. `SourceResolved=False` reasons: `SourceNotFound`, `UnsupportedDriver`
-   (only the two FSx drivers in v1alpha1), `SourceNotCSI`. A source with `reclaimPolicy: Delete`
-   resolves but sets a warning reason on `Ready` (`SourceReclaimDelete`), since deleting the source
-   PVC would delete the file system; generated PVs are always Retain regardless.
-3. Copy only allow-listed fields (driver, volumeHandle, the driver's known attribute keys,
-   mountOptions, capacity). Annotations such as `pv.kubernetes.io/provisioned-by` are never copied.
-4. Count Ready claims.
+## Decisions
 
-## Watches
-
-| Watched | Maps to |
-|---|---|
-| SharedFilesystemClaim | itself |
-| PVC (owned) | owner claim |
-| PV with the managed-by label | claim via labels |
-| SharedFilesystem | every claim referencing it (field index on `spec.filesystemRef.name`) |
-| Namespace (label change) | every claim in it |
-| Source PV | SharedFilesystem via field index on `spec.source.persistentVolumeName` |
-
-## Boundaries
-
-- Distribution, not isolation: every ReadWrite tenant can modify the whole file system root.
-- Tenants need RBAC only on SharedFilesystemClaim; they never get PV permissions.
-- No admission webhook: every per-object rule is expressible in the CRD schema (enum, default,
-  CEL immutability). Rules that depend on other objects (namespace labels, the filesystem's
-  maxAccess) change after admission, so they are evaluated in reconcile and reported in conditions.
-- Teardown order: delete claims, then filesystems, then the controller, then the CRDs. Deleting
-  the CRD first cascades to every claim; deleting the controller first leaves finalizers stuck.
+| Decision | Alternatives considered | Why |
+|---|---|---|
+| PV name `sfc-<claim UID>` | `<namespace>-<name>` | Injective (`a-b`+`c` and `a`+`b-c` collide when joined), and the orphan reconciler can read the claim UID back from a name only cluster admins can change |
+| `volumeHandle` = source handle + `-sfc-` + claim UID | the source handle | kubelet identifies a CSI volume by driver and handle (M1 makes a per-PV handle safe); the source handle is limited to 87 bytes so the result fits the CSI limit of 128 |
+| Ownership of a PVC is `spec.volumeName == sfc-<claim UID>` | ownerReference, labels | Tenants can edit ownerReferences and labels on their PVCs; `volumeName` is what the binder treats as authoritative, and it cannot reach anything not granted because the PV is reserved for this namespace and name |
+| PV by server-side apply, `claimRef` namespace and name only | CreateOrUpdate | `claimRef` is a granular struct: sharedfs owns namespace and name, the PV controller owns uid and resourceVersion, and neither overwrites the other. An unchanged apply is not a write (no `resourceVersion` change, checked by the e2e) |
+| PVC created once, never updated | apply, CreateOrUpdate | Both would silently adopt someone else's PVC of the same name. Nothing in a PVC spec changes after creation |
+| PVC requests `min(1Gi, source capacity)` | the source capacity | A static PV binds when its capacity covers the request; charging a namespace's storage ResourceQuota the whole file system would block it |
+| Heal only a `Released` PV, with a JSON-patch `test` on `resourceVersion` | clear whenever the UID differs | A cached PVC with an old UID would otherwise unbind a correctly Bound volume |
+| CSI drift keeps the old CSI source and still applies the mutable fields | stop reconciling the PV | A PV's volume source cannot change; the `ro` option and the reservation must stay enforced |
+| No admission webhook | validating webhook for cross-object rules | Every per-object rule is in the schema (enum, default, CEL immutability). Rules that depend on other objects change after admission, so they are evaluated in reconcile and shown in conditions |
+| Driver table in code | configuration | Each row asserts a property of the driver's mount checked against its source; making it configurable invites EFS, which mounts from `volumeHandle` |
+| PVC watch maps any PVC to the claim of the same name | `Owns` (ownerReference) | A foreign PVC whose deletion should clear `PVCConflict` has no ownerReference, and tenants can remove ours |
 
 ## Not in v1alpha1
 
-EFS (its driver parses `volumeHandle` as the mount target, so the handle cannot be suffixed), sub
-directory mounts, adopting hand-made PVs, automatic re-creation on source change, conversion and
-multiple versions.
+EFS, sub-directory mounts, adopting hand-made PVs, following source changes automatically, eviction of running pods on withdrawal, conversion and multiple versions.

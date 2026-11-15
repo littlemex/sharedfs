@@ -1,135 +1,122 @@
 # sharedfs
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+**Mount one existing FSx file system from many namespaces, with each namespace granted read-only or read-write access.**
 
-## Getting Started
+A static PersistentVolume binds to exactly one PersistentVolumeClaim, and the dynamic provisioners of FSx for Lustre and FSx for OpenZFS create a whole new file system per claim. Sharing one existing file system across namespaces therefore means one static PersistentVolume per namespace, each reserved for the right claim, each pointing at the same file system. sharedfs makes that a pair of custom resources:
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+- **SharedFilesystem** (cluster-scoped, created by the platform admin) names the existing PersistentVolume of the file system and grants namespaces read-only or read-write access.
+- **SharedFilesystemClaim** (namespaced, created by the tenant) asks for a mount. The controller creates a PersistentVolumeClaim with the claim's own name, bound to a PersistentVolume generated for this claim only.
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
-
-```sh
-make docker-build docker-push IMG=<some-registry>/sharedfs:tag
+```yaml
+apiVersion: sharedfs.littlemex.github.io/v1alpha1
+kind: SharedFilesystem
+metadata:
+  name: training-data
+spec:
+  persistentVolumeRef:
+    name: fsx-training
+  grants:
+  - namespaceSelector:
+      matchLabels: {sharedfs.example.com/training-data: rw}
+    access: ReadWrite
+  - namespaceSelector:
+      matchLabels: {sharedfs.example.com/training-data: ro}
+    access: ReadOnly
+---
+apiVersion: sharedfs.littlemex.github.io/v1alpha1
+kind: SharedFilesystemClaim
+metadata:
+  name: data
+  namespace: team-a
+spec:
+  filesystemRef:
+    name: training-data
+  access: ReadOnly
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+Pods in `team-a` then mount `persistentVolumeClaim: {claimName: data}`.
 
-**Install the CRDs into the cluster:**
+## What the controller guarantees
 
-```sh
-make install
+| Guarantee | How |
+|---|---|
+| A generated volume exists only while its SharedFilesystem exists and grants its namespace the access it has | Grants are evaluated on every reconcile, before any other check. A namespace that loses its grant has its PersistentVolumeClaim deleted after a grace period (`--revocation-grace-period`, default 30s) and a live re-read of the namespace and the SharedFilesystem |
+| No other namespace can bind a generated volume | Each PersistentVolume is reserved with `claimRef` (namespace and name) for exactly one PersistentVolumeClaim |
+| Deleting a generated volume never deletes the file system | Generated PersistentVolumes are always `Retain`, carry their own `volumeHandle`, and copy no provisioner annotation from the source |
+| `ReadOnly` is enforced at mount time | The `ro` mount option. Both FSx CSI drivers reject the `ReadOnlyMany` access mode, so generated volumes are `ReadWriteMany` with `ro` added for read-only claims |
+| A PVC deleted and recreated rebinds without manual steps | A `Released` volume that still holds the old claim UID has only `claimRef.uid` and `claimRef.resourceVersion` cleared, conditional on the volume not having changed |
+| Nothing is left behind | A claim's finalizer deletes its PVC, then its PersistentVolume. A third reconciler removes generated volumes whose claim is gone (finalizer removed by hand, restored from a backup) and sweeps once at startup |
+| A SharedFilesystem is not deleted under its tenants | Its finalizer waits until no generated PersistentVolume points at it, and its status lists the claims that remain |
+
+## What it does not do
+
+- **Isolation.** Every namespace granted `ReadWrite` can modify the whole file system. Use separate file systems, or FSx for OpenZFS child volumes, for isolation.
+- **Stopping running pods.** Revoking access deletes the PersistentVolumeClaim; pods already running keep their mount until they stop, and new pods cannot start. Evict them if access must end at once.
+- **Namespace label security.** Grants select namespaces by label. Tenants must not be able to edit those labels; selecting on `kubernetes.io/metadata.name` avoids the question.
+- **EFS.** `efs.csi.aws.com` mounts from `volumeHandle`, so a generated volume cannot carry its own handle. It is not supported.
+- **Following source changes.** If the source PersistentVolume's CSI fields change, existing volumes keep the old ones and claims report `Ready=False (SourceChanged)`. Recreate the claim to remount.
+
+## Supported drivers
+
+| Driver | Mounts from | Verified on |
+|---|---|---|
+| `fsx.csi.aws.com` | `volumeAttributes.dnsname`, `mountname` | EKS 1.35, FSx for Lustre |
+| `fsx.openzfs.csi.aws.com` | `volumeAttributes.DNSName`, `ResourceType`, `VolumePath` | EKS 1.35, FSx for OpenZFS |
+
+The table is part of the code ([internal/driver/driver.go](internal/driver/driver.go)) rather than configuration: each row asserts that the driver's mount does not depend on `volumeHandle`, checked against the driver source.
+
+## Status
+
+```console
+$ kubectl get sfs
+NAME            VOLUME         DRIVER            VOLUMES   READY   REASON     AGE
+training-data   fsx-training   fsx.csi.aws.com   2         True    Resolved   5m
+$ kubectl get sfc -A
+NAMESPACE   NAME   FILESYSTEM      ACCESS     READY   AGE
+team-a      data   training-data   ReadOnly   True    4m
+team-c      data   training-data   ReadOnly   False   1m
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+A claim has three conditions. `Accepted` says whether the namespace is granted the requested access and the file system can be used; `Bound` reports the generated PVC and PV as they are; `Ready` is both, and carries the reason of the first that does not hold.
 
-```sh
-make deploy IMG=<some-registry>/sharedfs:tag
+| Condition | Reasons |
+|---|---|
+| `Accepted` | `Accepted`, `NamespaceNotGranted`, `AccessNotGranted`, `FilesystemNotFound` (these three withdraw access), `FilesystemDeleting`, `FilesystemNotReady` (these keep existing volumes) |
+| `Bound` | `Bound`, `NoVolume`, `PVCPending`, `PVCConflict`, `PVCTerminating`, `PVCLost`, `PVCCreateFailed`, `VolumeTerminating` |
+| `Ready` | `Ready`, `Revoking`, `SourceChanged`, `Deleting`, or the reason copied from `Accepted` / `Bound` |
+
+A SharedFilesystem has `Ready` with `Resolved`, `SourceNotFound`, `SourceNotCSI`, `UnsupportedDriver`, `SourceIsGenerated`, `InvalidSource`, `InvalidGrant` or `VolumesRemaining`. A source with `reclaimPolicy: Delete` resolves, with a warning in the message and an event, because deleting that source's own PVC deletes the file system.
+
+## Install
+
+The controller needs no cloud credentials: it reads and writes Kubernetes objects only.
+
+```bash
+export IMG=<registry>/sharedfs-controller:<tag>
+make docker-build docker-push IMG=$IMG
+make deploy IMG=$IMG
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+`make build-installer IMG=$IMG` writes a single `dist/install.yaml` instead.
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+To remove sharedfs, delete in this order: SharedFilesystemClaims, SharedFilesystems, then the controller (`make undeploy`). Deleting the CRDs first deletes every claim at once; deleting the controller first leaves the finalizers with no one to remove them.
 
-```sh
-kubectl apply -k config/samples/
+## Development
+
+```bash
+make test
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+runs the unit tests and the controller tests against a local API server ([envtest](https://book.kubebuilder.io/reference/envtest)). envtest has no PersistentVolume binder, garbage collector or protection controllers, so binding and mounting are covered by [test/e2e-eks/run.sh](test/e2e-eks/run.sh), which runs against a real cluster and a real file system:
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
+```bash
+test/e2e-eks/run.sh <source PersistentVolume> <node name>
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+It mounts a read-write and a read-only claim on one node, writes and reads a nonce, checks that the read-only mount refuses writes, that an ungranted namespace gets nothing, that a recreated PVC rebinds, that revocation keeps the volume through the grace period and then withdraws it, and that deletion goes PVC, then PersistentVolume, then claim. It cleans up after itself and writes one directory, which it removes, on the file system.
 
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/sharedfs:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/sharedfs/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+See [docs/DESIGN.md](docs/DESIGN.md) for the reasoning behind each choice.
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Apache License 2.0.

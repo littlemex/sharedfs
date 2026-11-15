@@ -76,6 +76,7 @@ check "SharedFilesystem Ready on a source whose phase does not matter" wait_for 
 kubectl get sfs "$P"
 
 step "1. read-write and read-only claims mount on one node"
+T0=$(date +%s)
 for pair in "$NS_RW:ReadWrite" "$NS_RO:ReadOnly"; do
   kubectl apply -f - >/dev/null <<EOF
 apiVersion: sharedfs.littlemex.github.io/v1alpha1
@@ -86,6 +87,7 @@ EOF
 done
 check "rw claim Ready" wait_for 60 cond_is "$NS_RW" data Ready True/Ready
 check "ro claim Ready" wait_for 60 cond_is "$NS_RO" data Ready True/Ready
+echo "seconds from creating the claims to both Ready: $(( $(date +%s) - T0 ))"
 pod "$NS_RW" w data; pod "$NS_RO" r data
 check "rw pod running" wait_for 120 running "$NS_RW" w
 check "ro pod running" wait_for 120 running "$NS_RO" r
@@ -118,7 +120,9 @@ check "a PVC naming the rw PV stays Pending" pvc_phase_is "$NS_NONE" steal Pendi
 step "3. deleting the PVC heals with no human step (Released trap)"
 kubectl -n "$NS_RW" delete pod w --wait=true >/dev/null
 OLD_UID=$(kubectl -n "$NS_RW" get pvc data -o jsonpath='{.metadata.uid}')
-kubectl -n "$NS_RW" delete pvc data --wait=true >/dev/null
+# --wait=false: the controller recreates a PVC of the same name at once, which kubectl --wait
+# can keep waiting on.
+kubectl -n "$NS_RW" delete pvc data --wait=false >/dev/null
 check "a new PVC is created and Bound" wait_for 90 sh -c "pvc=\$(kubectl -n $NS_RW get pvc data -o jsonpath='{.metadata.uid}/{.status.phase}' 2>/dev/null); [ \"\${pvc%/*}\" != $OLD_UID ] && [ \"\${pvc#*/}\" = Bound ]"
 kubectl get events -n "$NS_RW" --field-selector reason=Rebinding -o custom-columns=REASON:.reason,NOTE:.note 2>/dev/null | tail -2
 pod "$NS_RW" w data
@@ -143,12 +147,31 @@ kubectl -n "$NS_RO" get events --field-selector involvedObject.name=r2 -o custom
 kubectl -n "$NS_RO" delete pod r r2 --wait=true >/dev/null
 check "PVC and PV are gone once the pods stop" wait_for 90 sh -c "! kubectl -n $NS_RO get pvc data >/dev/null 2>&1 && [ -z \"\$(kubectl -n $NS_RO get sfc data -o jsonpath='{.status.persistentVolumeName}')\" ]"
 
+step "5b. a claim removed without its finalizer leaves nothing behind"
+kubectl apply -f - >/dev/null <<EOF
+apiVersion: sharedfs.littlemex.github.io/v1alpha1
+kind: SharedFilesystemClaim
+metadata: {name: stray, namespace: $NS_RW}
+spec: {filesystemRef: {name: $P}}
+EOF
+check "stray claim Ready" wait_for 60 cond_is "$NS_RW" stray Ready True/Ready
+STRAY_PV=$(kubectl -n "$NS_RW" get sfc stray -o jsonpath='{.status.persistentVolumeName}')
+kubectl -n "$NS_RW" delete sfc stray --wait=false >/dev/null
+kubectl -n "$NS_RW" patch sfc stray --type=merge -p '{"metadata":{"finalizers":null}}' >/dev/null 2>&1
+check "its PVC and PV are swept" wait_for 60 sh -c "! kubectl -n $NS_RW get pvc stray >/dev/null 2>&1 && ! kubectl get pv $STRAY_PV >/dev/null 2>&1"
+
 step "6. the SharedFilesystem waits for its volumes"
 kubectl delete sfs "$P" --wait=false >/dev/null
 check "SharedFilesystem reports VolumesRemaining" wait_for 30 sh -c "kubectl get sfs $P -o jsonpath='{.status.conditions[0].reason}' | grep -q VolumesRemaining"
 check "the rw claim reports FilesystemDeleting" wait_for 30 cond_is "$NS_RW" data Accepted False/FilesystemDeleting
 sleep $((GRACE+5))
 check "and keeps its PVC past the grace period" sh -c "[ -z \"\$(kubectl -n $NS_RW get pvc data -o jsonpath='{.metadata.deletionTimestamp}')\" ]"
+
+step "6b. removing the grants of a SharedFilesystem being deleted still withdraws access"
+kubectl patch sfs "$P" --type=merge -p '{"spec":{"grants":null}}' >/dev/null
+check "claim reports NamespaceNotGranted" wait_for 30 cond_is "$NS_RW" data Accepted False/NamespaceNotGranted
+check "PVC Terminating after the grace period" wait_for $((GRACE+30)) sh -c "[ -n \"\$(kubectl -n $NS_RW get pvc data -o jsonpath='{.metadata.deletionTimestamp}')\" ]"
+check "claim names the pod that still mounts it" sh -c "kubectl -n $NS_RW get sfc data -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].message}' | grep -q 'still mounted by w'"
 
 step "7. deleting a claim in use waits for its pod, then PVC, PV, claim go in order"
 kubectl -n "$NS_RW" delete sfc data --wait=false >/dev/null

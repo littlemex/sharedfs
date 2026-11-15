@@ -42,26 +42,29 @@ const (
 	ReasonVolumesRemaining  = "VolumesRemaining"
 )
 
-// Reasons of claim Accepted. The first three withdraw access when they persist past the
-// revocation grace period; the others leave existing volumes in place.
+// Reasons of claim Accepted. NamespaceNotGranted, AccessNotGranted and FilesystemNotFound
+// withdraw access when they persist past the revocation grace period; the others leave existing
+// volumes in place.
 const (
 	ReasonAccepted            = "Accepted"
 	ReasonNamespaceNotGranted = "NamespaceNotGranted"
 	ReasonAccessNotGranted    = "AccessNotGranted"
 	ReasonFilesystemNotFound  = "FilesystemNotFound"
 	ReasonFilesystemDeleting  = "FilesystemDeleting"
-	ReasonFilesystemNotReady  = "FilesystemNotReady"
+	// A claim whose filesystem cannot be used carries the filesystem's own Ready reason
+	// (SourceNotFound, UnsupportedDriver, InvalidGrant, ...), so each reason names one cause.
 )
 
 // Reasons of claim Bound.
 const (
-	ReasonBound            = "Bound"
-	ReasonNoVolume         = "NoVolume"
-	ReasonPVCPending       = "PVCPending"
-	ReasonPVCConflict      = "PVCConflict"
-	ReasonPVCTerminating   = "PVCTerminating"
-	ReasonPVCLost          = "PVCLost"
-	ReasonPVCCreateFailed  = "PVCCreateFailed"
+	ReasonBound             = "Bound"
+	ReasonNoVolume          = "NoVolume"
+	ReasonPVCPending        = "PVCPending"
+	ReasonPVCConflict       = "PVCConflict"
+	ReasonPVCTerminating    = "PVCTerminating"
+	ReasonPVCLost           = "PVCLost"
+	ReasonPVCCreateFailed   = "PVCCreateFailed"
+	ReasonVolumeApplyFailed = "VolumeApplyFailed"
 	ReasonVolumeTerminating = "VolumeTerminating"
 )
 
