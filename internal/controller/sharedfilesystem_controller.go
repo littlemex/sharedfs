@@ -73,7 +73,7 @@ func (r *SharedFilesystemReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 	}
 
-	before := fs.Status.DeepCopy()
+	before := fs.DeepCopy()
 	pvs, err := r.generatedVolumes(ctx, r.Client, &fs)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -143,7 +143,7 @@ func (r *SharedFilesystemReconciler) finalize(ctx context.Context, fs *sharedfsv
 		return ctrl.Result{}, err
 	}
 	if len(pvs) > 0 {
-		before := fs.Status.DeepCopy()
+		before := fs.DeepCopy()
 		fs.Status.Volumes = int32(len(pvs))
 		setCondition(&fs.Status.Conditions, fs.Generation, sharedfsv1alpha1.ConditionReady, metav1.ConditionFalse,
 			sharedfsv1alpha1.ReasonVolumesRemaining, remainingMessage(pvs))
@@ -176,11 +176,11 @@ func (r *SharedFilesystemReconciler) generatedVolumes(ctx context.Context, reade
 	return pvs.Items, err
 }
 
-func (r *SharedFilesystemReconciler) updateStatus(ctx context.Context, fs *sharedfsv1alpha1.SharedFilesystem, before *sharedfsv1alpha1.SharedFilesystemStatus) error {
-	if equality.Semantic.DeepEqual(before, &fs.Status) {
+func (r *SharedFilesystemReconciler) updateStatus(ctx context.Context, fs *sharedfsv1alpha1.SharedFilesystem, before *sharedfsv1alpha1.SharedFilesystem) error {
+	if equality.Semantic.DeepEqual(&before.Status, &fs.Status) {
 		return nil
 	}
-	return r.Status().Update(ctx, fs)
+	return r.Status().Patch(ctx, fs, client.MergeFrom(before))
 }
 
 // SetupWithManager sets up the controller with the Manager.

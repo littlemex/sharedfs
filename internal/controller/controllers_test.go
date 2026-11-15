@@ -202,8 +202,11 @@ var _ = Describe("SharedFilesystem", func() {
 	It("refuses to change the source", func() {
 		fs := sharedFS("fs-"+rand.String(6), "a")
 		Expect(k8sClient.Create(ctx, fs)).To(Succeed())
-		fs.Spec.PersistentVolumeRef.Name = "b"
-		err := k8sClient.Update(ctx, fs)
-		Expect(apierrors.IsInvalid(err)).To(BeTrue(), fmt.Sprint(err))
+		// Retry on Conflict: the controller adds its finalizer concurrently.
+		Eventually(func() error {
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(fs), fs)).To(Succeed())
+			fs.Spec.PersistentVolumeRef.Name = "b"
+			return k8sClient.Update(ctx, fs)
+		}, timeout, interval).Should(WithTransform(apierrors.IsInvalid, BeTrue()))
 	})
 })

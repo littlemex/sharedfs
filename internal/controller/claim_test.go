@@ -129,7 +129,9 @@ var _ = Describe("SharedFilesystemClaim", func() {
 		Eventually(conditionOf(c, sharedfsv1alpha1.ConditionAccepted), timeout, interval).
 			Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonNamespaceNotGranted))
 		By("keeping the PVC during the grace period")
-		Consistently(notDeleting(pvc), gracePeriod-time.Second, interval).Should(Succeed())
+		// lastTransitionTime is stored with one-second resolution, so the grace period can end up
+		// to a second early; check the part that is guaranteed.
+		Consistently(notDeleting(pvc), gracePeriod-1500*time.Millisecond, interval).Should(Succeed())
 		By("then deleting PVC and PV")
 		Eventually(gone(pvc), timeout, interval).Should(BeTrue())
 		Eventually(gone(pvOf(c)), timeout, interval).Should(BeTrue())

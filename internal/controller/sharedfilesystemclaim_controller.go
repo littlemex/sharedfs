@@ -59,7 +59,8 @@ type SharedFilesystemClaimReconciler struct {
 	Recorder  events.EventRecorder
 	// RevocationGracePeriod is how long a rejection that withdraws access must last before the
 	// volumes are deleted, so a label that disappears for a moment (a GitOps sync, a typo fixed
-	// seconds later) does not take a running workload's volume away.
+	// seconds later) does not take a running workload's volume away. It is counted from the
+	// Accepted condition's lastTransitionTime, which has one-second resolution.
 	RevocationGracePeriod time.Duration
 }
 
@@ -101,7 +102,7 @@ func (r *SharedFilesystemClaimReconciler) Reconcile(ctx context.Context, req ctr
 			return ctrl.Result{}, err
 		}
 	}
-	before := claim.Status.DeepCopy()
+	before := claim.DeepCopy()
 	claim.Status.ObservedGeneration = claim.Generation
 
 	a, err := r.admit(ctx, r.Client, &claim)
@@ -347,7 +348,7 @@ func (r *SharedFilesystemClaimReconciler) finalize(ctx context.Context, claim *s
 		return ctrl.Result{}, err
 	}
 	if !done {
-		before := claim.Status.DeepCopy()
+		before := claim.DeepCopy()
 		setCondition(&claim.Status.Conditions, claim.Generation, sharedfsv1alpha1.ConditionReady, metav1.ConditionFalse,
 			sharedfsv1alpha1.ReasonDeleting,
 			"deleting the PersistentVolumeClaim, then the PersistentVolume; pods that mount the PVC keep it until they stop")
@@ -453,11 +454,13 @@ func (r *SharedFilesystemClaimReconciler) setReady(claim *sharedfsv1alpha1.Share
 }
 
 func (r *SharedFilesystemClaimReconciler) updateStatus(ctx context.Context, claim *sharedfsv1alpha1.SharedFilesystemClaim,
-	before *sharedfsv1alpha1.SharedFilesystemClaimStatus) error {
-	if equality.Semantic.DeepEqual(before, &claim.Status) {
+	before *sharedfsv1alpha1.SharedFilesystemClaim) error {
+	if equality.Semantic.DeepEqual(&before.Status, &claim.Status) {
 		return nil
 	}
-	return r.Status().Update(ctx, claim)
+	// A merge patch of the status this controller alone writes: no read-modify-write
+	// conflict with the finalizer patch or a cache that is one write behind.
+	return r.Status().Patch(ctx, claim, client.MergeFrom(before))
 }
 
 // SetupWithManager sets up the controller with the Manager.
