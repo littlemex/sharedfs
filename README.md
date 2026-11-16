@@ -52,6 +52,8 @@ Pods in `team-a` then mount `persistentVolumeClaim: {claimName: data}`.
 
 - **Isolation.** Every namespace granted `ReadWrite` can modify the whole file system. Use separate file systems, or FSx for OpenZFS child volumes, for isolation.
 - **Stopping running pods.** Revoking access deletes the PersistentVolumeClaim; pods already running keep their mount until they stop, and new pods cannot start. Evict them if access must end at once.
+- **The source PersistentVolume is not protected by sharedfs.** If it has no `claimRef`, any namespace can bind it directly by naming it in a PVC's `volumeName`, bypassing the grants; the SharedFilesystem warns about this. Keep the source bound, or reserve it with `claimRef` for a PVC in an admin-only namespace.
+- **Grants are not a data security boundary on their own.** A tenant who can run privileged pods, or (for NFS-based file systems such as OpenZFS) use an inline `nfs` volume under a permissive Pod Security level, can mount the file system without sharedfs. Network access, export settings and POSIX permissions remain the real boundary.
 - **Namespace label security.** Grants select namespaces by label. Tenants must not be able to edit those labels, nor write `sharedfilesystemclaims/status`; selecting on `kubernetes.io/metadata.name` avoids the label question. A grant's selector must not be empty; to grant every namespace, match `kubernetes.io/metadata.name` with operator `Exists`.
 - **EFS.** `efs.csi.aws.com` mounts from `volumeHandle`, so a generated volume cannot carry its own handle. It is not supported.
 - **Following source changes.** If the source PersistentVolume's CSI fields change, existing volumes keep the old ones and claims report `Ready=False (SourceChanged)`. Recreate the claim to remount.

@@ -117,11 +117,21 @@ func (r *SharedFilesystemReconciler) resolve(ctx context.Context, fs *sharedfsv1
 	}
 	fs.Status.Resolved = src.Status()
 	msg := fmt.Sprintf("%s on %s", src.VolumeHandle, src.Profile.Name)
+	prev := meta.FindStatusCondition(fs.Status.Conditions, sharedfsv1alpha1.ConditionReady)
+	if pv.Spec.ClaimRef == nil {
+		// Not sharedfs's to fix, but it defeats the grants: any namespace can bind the source
+		// itself by naming it in volumeName.
+		msg += unreservedWarning
+		if prev == nil || !strings.Contains(prev.Message, unreservedWarning) {
+			r.Recorder.Eventf(fs, &pv, corev1.EventTypeWarning, "SourceUnreserved", "Resolve",
+				"PersistentVolume %s has no claimRef: any namespace can bind it directly by naming it in a PVC's volumeName, bypassing the grants; reserve it with claimRef", pv.Name)
+		}
+	}
 	if pv.Spec.PersistentVolumeReclaimPolicy == corev1.PersistentVolumeReclaimDelete {
 		// Not a failure: generated volumes are Retain. But whoever deletes the source's own PVC
 		// deletes the file system under every tenant, so say so where the admin looks.
 		msg += reclaimDeleteWarning
-		if prev := meta.FindStatusCondition(fs.Status.Conditions, sharedfsv1alpha1.ConditionReady); prev == nil || !strings.HasSuffix(prev.Message, reclaimDeleteWarning) {
+		if prev == nil || !strings.Contains(prev.Message, reclaimDeleteWarning) {
 			r.Recorder.Eventf(fs, &pv, corev1.EventTypeWarning, "SourceReclaimDelete", "Resolve",
 				"PersistentVolume %s has reclaimPolicy Delete: deleting its PersistentVolumeClaim deletes the file system for every tenant", pv.Name)
 		}
@@ -129,7 +139,10 @@ func (r *SharedFilesystemReconciler) resolve(ctx context.Context, fs *sharedfsv1
 	return sharedfsv1alpha1.ReasonResolved, msg, nil
 }
 
-const reclaimDeleteWarning = "; warning: the source PersistentVolume has reclaimPolicy Delete"
+const (
+	reclaimDeleteWarning = "; warning: the source PersistentVolume has reclaimPolicy Delete"
+	unreservedWarning    = "; warning: the source PersistentVolume has no claimRef, so any namespace can bind it directly"
+)
 
 // finalize keeps the SharedFilesystem while any generated volume points at it.
 func (r *SharedFilesystemReconciler) finalize(ctx context.Context, fs *sharedfsv1alpha1.SharedFilesystem) (ctrl.Result, error) {

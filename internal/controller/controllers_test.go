@@ -174,6 +174,26 @@ var _ = Describe("SharedFilesystem", func() {
 			To(ContainSubstring("reclaimPolicy Delete"))
 	})
 
+	It("warns when the source PersistentVolume is not reserved", func() {
+		src := sourcePV("src-"+rand.String(6), corev1.PersistentVolumeReclaimRetain)
+		Expect(k8sClient.Create(ctx, src)).To(Succeed())
+		fs := sharedFS("fs-"+rand.String(6), src.Name)
+		Expect(k8sClient.Create(ctx, fs)).To(Succeed())
+		Eventually(conditionOf(fs, sharedfsv1alpha1.ConditionReady), timeout, interval).
+			Should(haveCondition(metav1.ConditionTrue, sharedfsv1alpha1.ReasonResolved))
+		Expect(meta.FindStatusCondition(fs.Status.Conditions, sharedfsv1alpha1.ConditionReady).Message).
+			To(ContainSubstring("no claimRef"))
+
+		By("the warning goes once the source is reserved")
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(src), src)).To(Succeed())
+		src.Spec.ClaimRef = &corev1.ObjectReference{Kind: "PersistentVolumeClaim", Namespace: "kube-system", Name: "reserved"}
+		Expect(k8sClient.Update(ctx, src)).To(Succeed())
+		Eventually(func(g Gomega) string {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(fs), fs)).To(Succeed())
+			return meta.FindStatusCondition(fs.Status.Conditions, sharedfsv1alpha1.ConditionReady).Message
+		}, timeout, interval).ShouldNot(ContainSubstring("no claimRef"))
+	})
+
 	It("reports a missing source, an unsupported driver and an invalid grant", func() {
 		missing := sharedFS("fs-"+rand.String(6), "does-not-exist")
 		Expect(k8sClient.Create(ctx, missing)).To(Succeed())
