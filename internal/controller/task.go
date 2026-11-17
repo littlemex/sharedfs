@@ -132,7 +132,9 @@ func (t *task) run(ctx context.Context, dir *sharedfsv1alpha1.FilesystemShareDir
 		// No report from the pod (evicted, OOM-killed, timed out): the reason comes from the pod.
 		setCondition(&dir.Status.Conditions, dir.Generation, t.condition, false, report.Outcome, truncate(report.Message))
 	}
-	if !ok {
+	if ok {
+		t.history.Failures, t.history.LastFailureTime = 0, nil
+	} else {
 		t.fail()
 	}
 	res := ctrl.Result{}

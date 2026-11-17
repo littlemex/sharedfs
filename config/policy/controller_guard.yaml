@@ -120,7 +120,7 @@ spec:
           c.securityContext.capabilities.add.all(a, a == 'CHOWN'))) ||
       (object.metadata.namespace == 'sharedfs-quota' && object.metadata.name.startsWith('sfs-quota-') &&
         object.spec.containers.all(c, c.image.split('@')[0] == params.data.quotaRepository &&
-          c.securityContext.capabilities.add.all(a, a in ['SYS_ADMIN', 'DAC_READ_SEARCH'])))
+          c.securityContext.capabilities.add.all(a, a == 'SYS_ADMIN')))
     message: "the sharedfs controller may only run its preparer and quota pods, from the configured repositories, with their capabilities"
   - expression: >-
       object.spec.containers.size() == 1 &&
@@ -144,8 +144,11 @@ spec:
         has(c.securityContext.readOnlyRootFilesystem) && c.securityContext.readOnlyRootFilesystem &&
         (!has(c.securityContext.seccompProfile) || c.securityContext.seccompProfile.type == 'RuntimeDefault') &&
         !has(c.securityContext.procMount) && !has(c.securityContext.appArmorProfile) &&
-        !has(c.securityContext.seLinuxOptions) && !has(c.securityContext.windowsOptions))
-    message: "a task pod must be one container by digest running the controller's binary (no command, a task argument, no environment), dropping all other capabilities, without privilege, host namespaces, sysctls or a token, read-only root, RuntimeDefault seccomp, mounting only its own internal claim"
+        !has(c.securityContext.seLinuxOptions) && !has(c.securityContext.windowsOptions) &&
+        !has(c.lifecycle) && !has(c.livenessProbe) && !has(c.readinessProbe) && !has(c.startupProbe)) &&
+      object.spec.restartPolicy == 'Never' &&
+      has(object.spec.activeDeadlineSeconds) && object.spec.activeDeadlineSeconds <= 600
+    message: "a task pod must be one container by digest running the controller's binary (no command, a task argument, no environment, no hooks or probes), never restarted, with a deadline, dropping all other capabilities, without privilege, host namespaces, sysctls or a token, read-only root, RuntimeDefault seccomp, mounting only its own internal claim"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

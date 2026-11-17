@@ -682,7 +682,8 @@ var _ = Describe("Directories", func() {
 		}, timeout, interval).Should(Succeed())
 		ct := qpod.Spec.Containers[0]
 		Expect(ct.Image).To(Equal(quotaImage))
-		Expect(ct.SecurityContext.Capabilities.Add).To(Equal([]corev1.Capability{"SYS_ADMIN", "DAC_READ_SEARCH"}))
+		Expect(ct.SecurityContext.Capabilities.Add).To(Equal([]corev1.Capability{"SYS_ADMIN"}))
+		Expect(*ct.SecurityContext.RunAsGroup).To(Equal(int64(1000)))
 		Expect(*qpod.Spec.AutomountServiceAccountToken).To(BeFalse())
 		Expect(ct.Args).To(Equal([]string{"set-quota", "--path=/target", fmt.Sprintf("--project-id=%d", dir.Spec.ProjectID),
 			"--storage-kib=10485760", "--inodes=100000", "--first-apply"}))

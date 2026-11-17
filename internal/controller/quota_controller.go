@@ -196,10 +196,16 @@ func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 		cfg := PreparerConfig{ServiceAccount: r.Quota.ServiceAccount, NodeSelector: r.Quota.NodeSelector,
 			Tolerations: r.Quota.Tolerations}
-		// SYS_ADMIN for the quotactl, which Lustre allows only to it, and DAC_READ_SEARCH to open a
-		// directory whatever its owner and mode. The pod mounts the directory itself, read-write
-		// because Lustre refuses quotactl on a read-only mount, and has no token.
-		return dir.Spec.Path, taskPod(cfg, r.Quota.Image, []corev1.Capability{"SYS_ADMIN", "DAC_READ_SEARCH"}, quotaMountPath, args), false, nil
+		// SYS_ADMIN only, for the quotactl, which Lustre allows only to it: no capability that
+		// reaches past the mount (a pod with CAP_DAC_READ_SEARCH can open files outside its
+		// directory mount by handle, measured). It opens the directory as root or through the
+		// share's group, and mounts only that directory, read-write because Lustre refuses
+		// quotactl on a read-only mount.
+		pod := taskPod(cfg, r.Quota.Image, []corev1.Capability{"SYS_ADMIN"}, quotaMountPath, args)
+		gid := share.Spec.Provision.GID
+		pod.Spec.Containers[0].SecurityContext.RunAsGroup = &gid
+		pod.Spec.SecurityContext.SupplementalGroups = []int64{gid}
+		return dir.Spec.Path, pod, false, nil
 	}, func(report taskReport, raw string) bool {
 		var out quota.Result
 		_ = json.Unmarshal([]byte(raw), &out)

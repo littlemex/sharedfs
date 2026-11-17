@@ -1,7 +1,7 @@
 // Package quota sets the Lustre project quota of one directory. It runs in the quota pod, which
-// mounts only that directory read-write and has only CAP_SYS_ADMIN (for the quotactl) and
-// CAP_DAC_READ_SEARCH (to open the directory whatever its owner), and calls lfs, which the quota
-// image carries. The directory must already carry its project ID: a directory sharedfs did
+// mounts only that directory read-write and has only CAP_SYS_ADMIN (for the quotactl), runs as
+// root with the share's group, and calls lfs, which the quota image carries. The directory must
+// be readable by root as its owner or by that group. The directory must already carry its project ID: a directory sharedfs did
 // not create is never tagged here, because tagging what is already in it would change files the
 // controller did not create.
 package quota
@@ -64,7 +64,8 @@ func Run(ctx context.Context, req Request) Result {
 	}
 	fd, err := unix.Open(req.Path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return Result{Outcome: Failed, Message: fmt.Sprintf("opening the directory: %v", err)}
+		return Result{Outcome: Failed, Message: fmt.Sprintf(
+			"opening the directory: %v (the quota pod runs as root with the share's group: the directory must be owned by root or give that group read and search)", err)}
 	}
 	id, inherit, err := prepare.ProjectOf(fd)
 	unix.Close(fd)
