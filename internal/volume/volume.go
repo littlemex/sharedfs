@@ -5,6 +5,7 @@ package volume
 import (
 	"maps"
 	"slices"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -38,6 +39,11 @@ const (
 
 // PVName is the name of the PersistentVolume provisioned for a claim.
 func PVName(pvcUID types.UID) string { return pvNamePrefix + string(pvcUID) }
+
+// IsTenantPVName reports whether a volume name is one sharedfs gives a tenant's claim.
+func IsTenantPVName(name string) bool {
+	return strings.HasPrefix(name, pvNamePrefix) && !strings.HasPrefix(name, preparerNamePrefix)
+}
 
 // PreparerName is the name of the internal PersistentVolume, claim and pod that prepare a
 // directory record.

@@ -49,6 +49,35 @@ func prepareDirectory(args []string) int {
 	return 0
 }
 
+// ownImage is the manager container's image, pinned to the digest it runs when the runtime
+// reports one, so a moving tag cannot hand the preparer different code.
+func ownImage(pod *corev1.Pod) string {
+	var image string
+	for _, c := range pod.Spec.Containers {
+		if c.Name == "manager" {
+			image = c.Image
+		}
+	}
+	if image == "" {
+		return ""
+	}
+	for _, s := range pod.Status.ContainerStatuses {
+		if s.Name != "manager" {
+			continue
+		}
+		if _, digest, ok := strings.Cut(s.ImageID, "@sha256:"); ok {
+			repo := image
+			if i := strings.Index(repo, "@"); i >= 0 {
+				repo = repo[:i]
+			} else if i := strings.LastIndex(repo, ":"); i > strings.LastIndex(repo, "/") {
+				repo = repo[:i]
+			}
+			return repo + "@sha256:" + digest
+		}
+	}
+	return image
+}
+
 // preparerConfig resolves where preparer pods run. The image defaults to the controller's own,
 // read from its pod, so the two can never drift apart.
 func preparerConfig(ctx context.Context, c client.Reader, image, sa, nodeSelector, tolerations string) (controller.PreparerConfig, error) {
@@ -69,14 +98,11 @@ func preparerConfig(ctx context.Context, c client.Reader, image, sa, nodeSelecto
 		if err := c.Get(ctx, types.NamespacedName{Namespace: cfg.Namespace, Name: name}, &pod); err != nil {
 			return cfg, fmt.Errorf("reading own pod for the preparer image: %w", err)
 		}
-		for _, ct := range pod.Spec.Containers {
-			if ct.Name == "manager" {
-				cfg.Image = ct.Image
-			}
-		}
+		cfg.Image = ownImage(&pod)
 		if cfg.Image == "" {
 			return cfg, errors.New("own pod has no container named manager")
 		}
+		cfg.ImagePullSecrets = pod.Spec.ImagePullSecrets
 	}
 	if nodeSelector != "" {
 		cfg.NodeSelector = map[string]string{}

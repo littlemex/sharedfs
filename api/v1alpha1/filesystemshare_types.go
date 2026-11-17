@@ -154,6 +154,7 @@ type FilesystemShareStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=fss,categories=sharedfs
+// +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 250",message="name must be at most 250 characters: the StorageClasses are named <name>-rw and <name>-ro"
 // +kubebuilder:printcolumn:name="Volume",type=string,JSONPath=`.spec.persistentVolumeRef.name`
 // +kubebuilder:printcolumn:name="Path",type=string,JSONPath=`.spec.path`
 // +kubebuilder:printcolumn:name="RW-Class",type=string,JSONPath=`.status.storageClasses.readWrite`,priority=1

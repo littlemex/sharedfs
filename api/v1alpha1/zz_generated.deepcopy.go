@@ -135,6 +135,10 @@ func (in *FilesystemShareDirectoryStatus) DeepCopyInto(out *FilesystemShareDirec
 		*out = new(ObservedDirectory)
 		**out = **in
 	}
+	if in.LastAttemptTime != nil {
+		in, out := &in.LastAttemptTime, &out.LastAttemptTime
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

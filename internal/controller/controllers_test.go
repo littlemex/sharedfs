@@ -309,6 +309,25 @@ var _ = Describe("FilesystemShare", func() {
 		create(other)
 		readyShare(other)
 
+		By("an inner share already in use is not stopped by an outer share that gains ReadWrite later")
+		src2 := sourcePV(uniq("src"))
+		outer2 := share(uniq("outer"), src2.Name, "teams", grant("a", sharedfsv1alpha1.AccessReadOnly))
+		inner2 := share(uniq("inner"), src2.Name, "teams/x", grant("in2", sharedfsv1alpha1.AccessReadWrite))
+		ns2 := namespace("in2")
+		create(src2, outer2, inner2, ns2)
+		readyShare(outer2)
+		readyShare(inner2)
+		create(claim(ns2.Name, inner2.Name+"-rw"))
+		Eventually(func() int32 {
+			_ = k8sClient.Get(ctx, client.ObjectKeyFromObject(inner2), inner2)
+			return inner2.Status.Volumes
+		}, timeout, interval).Should(BeNumerically(">", 0))
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(outer2), outer2)).To(Succeed())
+		outer2.Spec.Grants = []sharedfsv1alpha1.Grant{grant("a", sharedfsv1alpha1.AccessReadWrite)}
+		Expect(k8sClient.Update(ctx, outer2)).To(Succeed())
+		Eventually(readyOf(outer2), timeout, interval).Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonOverlappingShare))
+		Consistently(readyOf(inner2), 2*time.Second, interval).Should(haveCondition(metav1.ConditionTrue, sharedfsv1alpha1.ReasonResolved))
+
 		By("exempting the outer share lifts the block")
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(outer), outer)).To(Succeed())
 		outer.Annotations = map[string]string{sharedfsv1alpha1.AnnotationAllowOverlap: "true"}
@@ -388,13 +407,16 @@ var _ = Describe("Provisioner", func() {
 		rwOnRO := claim(granted.Name, s.Name+"-rw")
 		selector := claim(granted.Name, s.Name+"-ro")
 		selector.Spec.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"a": "b"}}
-		create(denied, rwOnRO, selector)
+		rwop := claim(granted.Name, s.Name+"-ro", corev1.ReadWriteOncePod)
+		create(denied, rwOnRO, selector, rwop)
 		for _, c := range []*corev1.PersistentVolumeClaim{denied, rwOnRO} {
 			neverProvisioned(c)
 			Eventually(eventReasons(c), timeout, interval).Should(ContainElement(sharedfsv1alpha1.EventNotGranted))
 		}
-		neverProvisioned(selector)
-		Eventually(eventReasons(selector), timeout, interval).Should(ContainElement(sharedfsv1alpha1.EventUnsupportedClaim))
+		for _, c := range []*corev1.PersistentVolumeClaim{selector, rwop} {
+			neverProvisioned(c)
+			Eventually(eventReasons(c), timeout, interval).Should(ContainElement(sharedfsv1alpha1.EventUnsupportedClaim))
+		}
 
 		By("granting the namespace provisions the waiting claim")
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(other), other)).To(Succeed())
@@ -434,6 +456,10 @@ var _ = Describe("Provisioner", func() {
 		create(pvc)
 		pv := provisioned(pvc)
 		bind(pvc, pv)
+		By("labels on the claim are the tenant's and change nothing")
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pvc), pvc)).To(Succeed())
+		pvc.Labels = map[string]string{sharedfsv1alpha1.LabelInternal: "x"}
+		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
 
 		By("a grant restored within the grace period cancels the withdrawal")
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ns), ns)).To(Succeed())
@@ -562,7 +588,7 @@ var _ = Describe("Directories", func() {
 			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(dir), dir)).To(Succeed())
 			return meta.FindStatusCondition(dir.Status.Conditions, sharedfsv1alpha1.ConditionPrepared)
 		}, timeout, interval).Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonInsecureParent))
-		Expect(dir.Status.Attempts).To(Equal(int32(1)))
+		Expect(dir.Status.Failures).To(Equal(int32(1)))
 		neverProvisioned(pvc)
 		Eventually(eventReasons(pvc), timeout, interval).Should(ContainElement(sharedfsv1alpha1.EventDirectoryNotReady))
 	})

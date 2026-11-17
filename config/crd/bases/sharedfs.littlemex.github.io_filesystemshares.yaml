@@ -330,6 +330,10 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: 'name must be at most 250 characters: the StorageClasses are named
+            <name>-rw and <name>-ro'
+          rule: size(self.metadata.name) <= 250
     served: true
     storage: true
     subresources:

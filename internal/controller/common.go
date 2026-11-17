@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -15,6 +16,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	sharedfsv1alpha1 "github.com/littlemex/sharedfs/api/v1alpha1"
@@ -46,6 +49,18 @@ func SetupIndexes(ctx context.Context, mgr ctrl.Manager) error {
 		return []string{string(o.(*sharedfsv1alpha1.FilesystemShareDirectory).Spec.ShareRef.UID)}
 	})
 }
+
+// shareChanged passes share events that can change a verdict about the share or its claims:
+// spec, annotations, deletion, readiness and whether it has volumes. A count that merely moves
+// does not re-run every claim of the share.
+var shareChanged = predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
+	a, b := e.ObjectOld.(*sharedfsv1alpha1.FilesystemShare), e.ObjectNew.(*sharedfsv1alpha1.FilesystemShare)
+	return a.Generation != b.Generation ||
+		!maps.Equal(a.Annotations, b.Annotations) ||
+		a.DeletionTimestamp.IsZero() != b.DeletionTimestamp.IsZero() ||
+		isReady(a) != isReady(b) ||
+		(a.Status.Volumes > 0) != (b.Status.Volumes > 0)
+}}
 
 // ClassNames are the StorageClasses of a share.
 func ClassNames(share *sharedfsv1alpha1.FilesystemShare) sharedfsv1alpha1.StorageClassNames {
@@ -149,4 +164,6 @@ type PreparerConfig struct {
 	ServiceAccount string
 	NodeSelector   map[string]string
 	Tolerations    []corev1.Toleration
+	// ImagePullSecrets are the controller pod's own, so the preparer pulls the same image.
+	ImagePullSecrets []corev1.LocalObjectReference
 }

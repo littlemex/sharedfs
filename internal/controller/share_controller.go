@@ -14,8 +14,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -23,18 +23,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	sharedfsv1alpha1 "github.com/littlemex/sharedfs/api/v1alpha1"
-	"github.com/littlemex/sharedfs/internal/driver"
 	"github.com/littlemex/sharedfs/internal/sharepath"
 	"github.com/littlemex/sharedfs/internal/volume"
 )
 
 // ShareReconciler checks that a FilesystemShare is safe to provision from, owns its two
-// StorageClasses, and keeps the share until no volume provisioned from it remains. It writes only
-// the share's status.
+// StorageClasses, and keeps the share, through its finalizer, until no volume provisioned from it
+// remains. Of the share it writes only the status and the finalizer.
 type ShareReconciler struct {
 	client.Client
 	APIReader client.Reader
-	Recorder  events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemshares,verbs=get;list;watch;update;patch
@@ -156,7 +154,7 @@ func (r *ShareReconciler) checkDriver(ctx context.Context, name string) (string,
 	var d storagev1.CSIDriver
 	if err := r.Get(ctx, types.NamespacedName{Name: name}, &d); err != nil {
 		if apierrors.IsNotFound(err) {
-			return sharedfsv1alpha1.ReasonUnsafeDriverPolicy, fmt.Sprintf("CSIDriver %s not found", name), nil
+			return sharedfsv1alpha1.ReasonDriverNotInstalled, fmt.Sprintf("CSIDriver %s is not installed", name), nil
 		}
 		return "", "", err
 	}
@@ -172,10 +170,12 @@ func (r *ShareReconciler) checkDriver(ctx context.Context, name string) (string,
 }
 
 // checkOverlap compares the share with every other share on the same file system. When one
-// share's path may contain the other's and the containing share grants ReadWrite, a writer of
-// the outer path can rename or plant files in what the inner one exposes. The newer share of
-// such a pair is not Ready, so creating a share never stops one already in use. A read-only
-// container only warns: its readers can read the inner path.
+// share's directory may lie strictly inside the other's and the outer share grants ReadWrite, a
+// writer of the outer path can rename or plant files in what the inner one exposes. One share of
+// such a pair is not Ready: a share with provisioned volumes before one without, so a share in
+// use is never stopped by another one, then the newer, then the greater UID. A read-only outer
+// share, and two shares that may name the same directory, only warn. A share being deleted counts
+// while it still has volumes.
 func (r *ShareReconciler) checkOverlap(ctx context.Context, share *sharedfsv1alpha1.FilesystemShare, src *volume.Source) (string, string, error) {
 	var list sharedfsv1alpha1.FilesystemShareList
 	if err := r.List(ctx, &list); err != nil {
@@ -185,17 +185,20 @@ func (r *ShareReconciler) checkOverlap(ctx context.Context, share *sharedfsv1alp
 	self, err := fullPath(base, share.Spec.Path)
 	if err != nil {
 		// Fail closed: a path that cannot be compared is not provisioned from.
-		return fmt.Sprintf("cannot compare path %s on %s with other shares: %v", share.Spec.Path, fs, err), "", nil
+		return fmt.Sprintf("cannot compare path %s with other shares: %v", share.Spec.Path, err), "", nil
 	}
 	var warnings []string
 	for i := range list.Items {
 		other := &list.Items[i]
-		if other.UID == share.UID || other.Status.Resolved == nil || !other.DeletionTimestamp.IsZero() {
+		if other.UID == share.UID || (!other.DeletionTimestamp.IsZero() && other.Status.Volumes == 0) {
 			continue
 		}
-		osrc := &volume.Source{VolumeAttributes: other.Status.Resolved.VolumeAttributes}
-		if p, ok := driver.Lookup(other.Status.Resolved.Driver); ok {
-			osrc.Profile = p
+		osrc, err := r.sourceOf(ctx, other)
+		if err != nil {
+			return "", "", err
+		}
+		if osrc == nil {
+			continue
 		}
 		ofs, obase := osrc.Identity()
 		if ofs != fs {
@@ -205,12 +208,18 @@ func (r *ShareReconciler) checkOverlap(ctx context.Context, share *sharedfsv1alp
 		if err != nil {
 			continue
 		}
-		var outer *sharedfsv1alpha1.FilesystemShare
+		otherHolds, shareHolds := sharepath.MayContain(them, self), sharepath.MayContain(self, them)
+		var outer, inner *sharedfsv1alpha1.FilesystemShare
 		switch {
-		case sharepath.MayContain(them, self):
-			outer = other
-		case sharepath.MayContain(self, them):
-			outer = share
+		case otherHolds && shareHolds:
+			if self.String() != them.String() {
+				warnings = append(warnings, fmt.Sprintf("share %s (path %s) may name the same directory for some namespace", other.Name, other.Spec.Path))
+			}
+			continue
+		case otherHolds:
+			outer, inner = other, share
+		case shareHolds:
+			outer, inner = share, other
 		default:
 			continue
 		}
@@ -218,16 +227,42 @@ func (r *ShareReconciler) checkOverlap(ctx context.Context, share *sharedfsv1alp
 			continue
 		}
 		if !grantsReadWrite(outer) {
-			warnings = append(warnings, fmt.Sprintf("share %s (path %s) can read what share %s exposes", outer.Name, outer.Spec.Path, other.Name))
+			warnings = append(warnings, fmt.Sprintf("readers of share %s (path %s) can read what share %s (path %s) exposes",
+				outer.Name, outer.Spec.Path, inner.Name, inner.Spec.Path))
 			continue
 		}
-		if newer(share, other) {
-			return fmt.Sprintf("share %s (path %s) grants ReadWrite on a path that may contain or be contained by %s; "+
-				"a writer of the outer path can replace the inner directory. Annotate the outer share with %s=true if that is intended",
-				outer.Name, outer.Spec.Path, share.Spec.Path, sharedfsv1alpha1.AnnotationAllowOverlap), "", nil
+		if gives(share, other) {
+			return fmt.Sprintf("share %s (path %s) grants ReadWrite on a directory that may contain share %s (path %s): "+
+				"a writer of the outer path can replace the inner directory. Annotate %s with %s=true if that is intended",
+				outer.Name, outer.Spec.Path, inner.Name, inner.Spec.Path, outer.Name, sharedfsv1alpha1.AnnotationAllowOverlap), "", nil
 		}
 	}
 	return "", strings.Join(warnings, "; "), nil
+}
+
+// sourceOf resolves another share's source, or nil if it has none that resolves.
+func (r *ShareReconciler) sourceOf(ctx context.Context, share *sharedfsv1alpha1.FilesystemShare) (*volume.Source, error) {
+	var pv corev1.PersistentVolume
+	if err := r.Get(ctx, types.NamespacedName{Name: share.Spec.PersistentVolumeRef.Name}, &pv); err != nil {
+		return nil, client.IgnoreNotFound(err)
+	}
+	src, err := volume.Resolve(&pv)
+	if err != nil {
+		return nil, nil
+	}
+	return src, nil
+}
+
+// gives reports whether a gives way to b in a conflicting pair. Both shares reach the same
+// verdict, and it does not depend on what either was judged before.
+func gives(a, b *sharedfsv1alpha1.FilesystemShare) bool {
+	if ua, ub := a.Status.Volumes > 0, b.Status.Volumes > 0; ua != ub {
+		return ub
+	}
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return b.CreationTimestamp.Before(&a.CreationTimestamp)
+	}
+	return a.UID > b.UID
 }
 
 // fullPath is a share's path from the file system root: the source's own sub-path base (for
@@ -237,19 +272,6 @@ func fullPath(base, path string) (sharepath.Template, error) {
 		return sharepath.Parse(path)
 	}
 	return sharepath.Parse(sharepath.Join(base, path))
-}
-
-// newer reports whether a should give way to b. Creation times have a resolution of one
-// second, so within the same second the share already Ready keeps its place, and the name
-// decides only between two shares in the same state. Both shares reach the same verdict.
-func newer(a, b *sharedfsv1alpha1.FilesystemShare) bool {
-	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
-		return b.CreationTimestamp.Before(&a.CreationTimestamp)
-	}
-	if ra, rb := isReady(a), isReady(b); ra != rb {
-		return rb
-	}
-	return a.Name > b.Name
 }
 
 func isReady(s *sharedfsv1alpha1.FilesystemShare) bool {
@@ -359,8 +381,10 @@ func (r *ShareReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&sharedfsv1alpha1.FilesystemShare{}).
 		Owns(&storagev1.StorageClass{}).
 		Watches(&corev1.PersistentVolume{}, handler.EnqueueRequestsFromMapFunc(r.sharesForPV)).
-		// Any share change can change another share's overlap verdict.
-		Watches(&sharedfsv1alpha1.FilesystemShare{}, handler.EnqueueRequestsFromMapFunc(r.allShares)).
+		Watches(&storagev1.CSIDriver{}, handler.EnqueueRequestsFromMapFunc(r.allShares)).
+		// A share's change can change another share's overlap verdict.
+		Watches(&sharedfsv1alpha1.FilesystemShare{}, handler.EnqueueRequestsFromMapFunc(r.allShares),
+			builder.WithPredicates(shareChanged)).
 		Named("filesystemshare").
 		Complete(r)
 }

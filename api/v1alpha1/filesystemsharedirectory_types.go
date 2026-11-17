@@ -54,8 +54,13 @@ type ObservedDirectory struct {
 type FilesystemShareDirectoryStatus struct {
 	// +optional
 	Observed *ObservedDirectory `json:"observed,omitempty"`
+	// failures counts preparer runs that did not prepare the directory; retries back off
+	// from 30s, doubling, to one hour.
 	// +optional
-	Attempts int32 `json:"attempts,omitempty"`
+	Failures int32 `json:"failures,omitempty"`
+	// lastAttemptTime is when the latest preparer pod was started.
+	// +optional
+	LastAttemptTime *metav1.Time `json:"lastAttemptTime,omitempty"`
 	// conditions: Prepared.
 	// +listType=map
 	// +listMapKey=type

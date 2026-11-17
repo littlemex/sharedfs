@@ -2,8 +2,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strings"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -13,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -54,7 +56,8 @@ func (r *ProvisionerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.Get(ctx, req.NamespacedName, &pvc); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if !pvc.DeletionTimestamp.IsZero() || volume.IsInternal(&pvc) {
+	// Labels on a claim are the tenant's to set, so nothing here trusts them.
+	if !pvc.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
 	if pvc.Spec.VolumeName != "" {
@@ -70,7 +73,8 @@ func (r *ProvisionerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 func (r *ProvisionerReconciler) provision(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (ctrl.Result, error) {
 	share, access, err := classOwner(ctx, r.Client, *pvc.Spec.StorageClassName)
 	if apierrors.IsNotFound(err) {
-		return ctrl.Result{}, nil
+		return r.pending(pvc, sharedfsv1alpha1.EventUnsupportedClaim, fmt.Sprintf(
+			"StorageClass %s names this provisioner but is not one of a FilesystemShare's classes", *pvc.Spec.StorageClassName))
 	}
 	if err != nil {
 		return ctrl.Result{}, err
@@ -80,11 +84,12 @@ func (r *ProvisionerReconciler) provision(ctx context.Context, pvc *corev1.Persi
 	}
 	ready := meta.FindStatusCondition(share.Status.Conditions, sharedfsv1alpha1.ConditionReady)
 	if ready == nil || ready.Status != metav1.ConditionTrue || ready.ObservedGeneration != share.Generation || !share.DeletionTimestamp.IsZero() {
-		msg := "the share has not been checked yet"
+		// Only the reason: the message names the source and other shares, which are the admin's.
+		msg := "it has not been checked yet"
 		if !share.DeletionTimestamp.IsZero() {
-			msg = "the share is being deleted"
+			msg = "it is being deleted"
 		} else if ready != nil && ready.Status == metav1.ConditionFalse {
-			msg = ready.Reason + ": " + ready.Message
+			msg = ready.Reason
 		}
 		return r.pending(pvc, sharedfsv1alpha1.EventShareNotReady, fmt.Sprintf("FilesystemShare %s is not Ready: %s", share.Name, msg))
 	}
@@ -102,17 +107,17 @@ func (r *ProvisionerReconciler) provision(ctx context.Context, pvc *corev1.Persi
 		return ctrl.Result{}, err
 	}
 	src, err := volume.Resolve(&sourcePV)
-	if err != nil {
-		// The share was Ready a moment ago; its own reconcile will turn it not Ready.
-		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	if err == nil && !src.Reserved {
+		err = errors.New("the source is no longer reserved")
 	}
-	tmpl, err := sharepath.Parse(share.Spec.Path)
-	if err != nil {
-		return ctrl.Result{}, nil
+	tmpl, perr := sharepath.Parse(share.Spec.Path)
+	if err != nil || perr != nil {
+		// The share was Ready a moment ago; its own reconcile turns it not Ready.
+		return r.pending(pvc, sharedfsv1alpha1.EventShareNotReady, fmt.Sprintf("FilesystemShare %s is not Ready: its source changed", share.Name))
 	}
 	expanded, err := tmpl.Expand(ns.Name)
 	if err != nil {
-		return r.pending(pvc, sharedfsv1alpha1.EventUnsupportedClaim, fmt.Sprintf("namespace %s does not make a valid path: %v", ns.Name, err))
+		return r.pending(pvc, sharedfsv1alpha1.EventUnsupportedClaim, fmt.Sprintf("namespace %s does not make a valid path for FilesystemShare %s: %v", ns.Name, share.Name, err))
 	}
 
 	if res, blocked, err := r.directory(ctx, pvc, share, &ns, tmpl, expanded); err != nil || blocked {
@@ -124,6 +129,9 @@ func (r *ProvisionerReconciler) provision(ctx context.Context, pvc *corev1.Persi
 		ExpandedPath: expanded, ClassName: *pvc.Spec.StorageClassName,
 	})
 	if err := r.Create(ctx, pv); err != nil {
+		if apierrors.IsInvalid(err) {
+			return r.pending(pvc, sharedfsv1alpha1.EventUnsupportedClaim, "the volume for this claim is invalid: "+err.Error())
+		}
 		// Already provisioned; the PV controller has yet to bind it.
 		return ctrl.Result{}, client.IgnoreAlreadyExists(err)
 	}
@@ -166,7 +174,11 @@ func (r *ProvisionerReconciler) directory(ctx context.Context, pvc *corev1.Persi
 		if err := controllerutil.SetOwnerReference(share, &dir, r.Scheme()); err != nil {
 			return ctrl.Result{}, true, err
 		}
-		if err := r.Create(ctx, &dir); err != nil && !apierrors.IsAlreadyExists(err) {
+		if err := r.Create(ctx, &dir); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				// Created a moment ago: check it on the next pass.
+				return ctrl.Result{RequeueAfter: time.Second}, true, nil
+			}
 			return ctrl.Result{}, true, err
 		}
 		if share.Spec.Provision == nil {
@@ -178,16 +190,10 @@ func (r *ProvisionerReconciler) directory(ctx context.Context, pvc *corev1.Persi
 	if err != nil {
 		return ctrl.Result{}, true, err
 	}
-	if dir.Spec.ShareRef.UID != share.UID || dir.Spec.Path != expanded {
-		res, err := r.pending(pvc, sharedfsv1alpha1.EventDirectoryNotReady, fmt.Sprintf(
-			"FilesystemShareDirectory %s does not belong to this share and path; delete it", name))
-		return res, true, err
-	}
 	if dir.Spec.NamespaceUID != nsUID {
 		res, err := r.pending(pvc, sharedfsv1alpha1.EventNamespaceRecreated, fmt.Sprintf(
-			"directory %s was recorded for an earlier namespace %s (uid %s); this namespace has uid %s. "+
-				"If this namespace should own the directory, an admin deletes FilesystemShareDirectory %s",
-			expanded, ns.Name, dir.Spec.NamespaceUID, ns.UID, name))
+			"directory %s belongs to an earlier namespace of the same name; "+
+				"if this namespace should own it, an admin deletes FilesystemShareDirectory %s", expanded, name))
 		return res, true, err
 	}
 	if share.Spec.Provision == nil {
@@ -214,6 +220,10 @@ func unsupported(pvc *corev1.PersistentVolumeClaim) string {
 		return "volumeMode Block is not supported: a share is a directory"
 	case pvc.Spec.DataSource != nil || pvc.Spec.DataSourceRef != nil:
 		return "dataSource is not supported: a share is an existing directory, not a copy"
+	case slices.Contains(pvc.Spec.AccessModes, corev1.ReadWriteOncePod):
+		return "ReadWriteOncePod is not supported: a share is mounted by many pods"
+	case pvc.Spec.VolumeAttributesClassName != nil:
+		return "volumeAttributesClassName is not supported"
 	}
 	return ""
 }
@@ -325,7 +335,8 @@ func (r *ProvisionerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.PersistentVolumeClaim{}).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.claimsInNamespace)).
-		Watches(&sharedfsv1alpha1.FilesystemShare{}, handler.EnqueueRequestsFromMapFunc(r.claimsOfShare)).
+		Watches(&sharedfsv1alpha1.FilesystemShare{}, handler.EnqueueRequestsFromMapFunc(r.claimsOfShare),
+			builder.WithPredicates(shareChanged)).
 		Watches(&sharedfsv1alpha1.FilesystemShareDirectory{}, handler.EnqueueRequestsFromMapFunc(r.claimsOfDirectory)).
 		Watches(&corev1.PersistentVolume{}, handler.EnqueueRequestsFromMapFunc(claimOfPV)).
 		Named("provisioner").
@@ -386,10 +397,7 @@ func ours(pvcs []corev1.PersistentVolumeClaim) []reconcile.Request {
 	keys := make([]types.NamespacedName, 0, len(pvcs))
 	for i := range pvcs {
 		p := &pvcs[i]
-		if volume.IsInternal(p) {
-			continue
-		}
-		if volume.ClaimedProvisioner(p) == sharedfsv1alpha1.ProvisionerName || strings.HasPrefix(p.Spec.VolumeName, volume.PVName("")) {
+		if volume.ClaimedProvisioner(p) == sharedfsv1alpha1.ProvisionerName || volume.IsTenantPVName(p.Spec.VolumeName) {
 			keys = append(keys, types.NamespacedName{Namespace: p.Namespace, Name: p.Name})
 		}
 	}

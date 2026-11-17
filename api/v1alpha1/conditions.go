@@ -37,6 +37,7 @@ const (
 	ReasonSubPathUnsupported = "SubPathUnsupported"
 	ReasonInvalidGrant       = "InvalidGrant"
 	ReasonUnsafeDriverPolicy = "UnsafeDriverPolicy"
+	ReasonDriverNotInstalled = "DriverNotInstalled"
 	ReasonOverlappingShare   = "OverlappingShare"
 	ReasonStorageClassTaken  = "StorageClassTaken"
 	ReasonVolumesRemaining   = "VolumesRemaining"
@@ -44,14 +45,15 @@ const (
 
 // Reasons of FilesystemShareDirectory Prepared.
 const (
-	ReasonDirectoryCreated  = "DirectoryCreated"
-	ReasonDirectoryExists   = "DirectoryExists"
-	ReasonPreparing         = "Preparing"
-	ReasonParentNotFound    = "ParentNotFound"
-	ReasonInsecureParent    = "InsecureParent"
-	ReasonNotADirectory     = "NotADirectory"
-	ReasonPermissionDenied  = "PermissionDenied"
-	ReasonPreparationFailed = "PreparationFailed"
+	ReasonDirectoryCreated   = "DirectoryCreated"
+	ReasonDirectoryExists    = "DirectoryExists"
+	ReasonPreparing          = "Preparing"
+	ReasonPreparerTimedOut   = "PreparerTimedOut"
+	ReasonInsecureParent     = "InsecureParent"
+	ReasonNotADirectory      = "NotADirectory"
+	ReasonPermissionDenied   = "PermissionDenied"
+	ReasonPreparationFailed  = "PreparationFailed"
+	ReasonPreparerNotCreated = "PreparerNotCreated"
 )
 
 // Event reasons on PersistentVolumeClaims.

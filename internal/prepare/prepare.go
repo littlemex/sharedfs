@@ -1,36 +1,50 @@
-// Package prepare creates or checks one directory inside a parent directory, without following
-// symlinks and without leaving a half-made directory behind. It runs inside the preparer pod,
-// which mounts the parent and has only CAP_CHOWN, and reports a Result as JSON.
+// Package prepare creates one directory inside a parent directory with a given owner and mode,
+// without following symlinks, without changing anything that already exists, and without ever
+// exposing a half-made directory under its final name. It runs inside the preparer pod, which
+// mounts the parent and runs as UID 0 with CAP_CHOWN only, and reports a Result as JSON.
 //
-// Creation is crash-safe without rename: the directory is made with mode 0000 owned by root, so
-// nobody but root can use it, then given its mode and owner through a file descriptor. A
-// root-owned, mode 0000, empty directory is therefore recognised as an interrupted creation and
-// completed on the next run. The parent must be owned by root and not writable by group or
-// others, so no tenant can swap entries between the steps.
+// The directory is made under a temporary name (".sharedfs-tmp-<random>", which no share path can
+// name because path segments may not start with "."), given its mode and then its owner through a
+// file descriptor, checked, and renamed to the final name without replacing anything. A crash
+// leaves only a temporary directory, which the next run removes. The parent must be owned by root
+// and not writable by group or others, so no tenant can create, swap or remove entries in it.
+//
+// Every step works with CAP_CHOWN alone: the process is the owner of what it creates (no
+// CAP_DAC_OVERRIDE needed to open it, mode 0700), sets the mode while it still owns the directory
+// (no CAP_FOWNER), and only then hands it over.
 package prepare
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
+	"strings"
 
 	"golang.org/x/sys/unix"
 
+	sharedfsv1alpha1 "github.com/littlemex/sharedfs/api/v1alpha1"
 	"github.com/littlemex/sharedfs/internal/sharepath"
 )
 
-// Outcomes, mirrored by FilesystemShareDirectory Prepared reasons.
+// Outcomes are FilesystemShareDirectory Prepared reasons.
 const (
-	Created          = "DirectoryCreated"
-	Exists           = "DirectoryExists"
-	NotADirectory    = "NotADirectory"
-	InsecureParent   = "InsecureParent"
-	PermissionDenied = "PermissionDenied"
-	Failed           = "PreparationFailed"
+	Created          = sharedfsv1alpha1.ReasonDirectoryCreated
+	Exists           = sharedfsv1alpha1.ReasonDirectoryExists
+	NotADirectory    = sharedfsv1alpha1.ReasonNotADirectory
+	InsecureParent   = sharedfsv1alpha1.ReasonInsecureParent
+	PermissionDenied = sharedfsv1alpha1.ReasonPermissionDenied
+	Failed           = sharedfsv1alpha1.ReasonPreparationFailed
 )
+
+// Outcomes lists every outcome a preparer may report; anything else is not trusted.
+var Outcomes = []string{Created, Exists, NotADirectory, InsecureParent, PermissionDenied, Failed}
+
+// TempPrefix starts the name of a directory being prepared.
+const TempPrefix = ".sharedfs-tmp-"
 
 // Request is one directory to prepare.
 type Request struct {
@@ -63,12 +77,15 @@ const permMask = 0o7777
 
 // Run prepares the directory.
 func Run(req Request) Result {
-	mode, err := parseMode(req.Mode)
+	mode, err := ParseMode(req.Mode)
 	if err != nil {
 		return Result{Outcome: Failed, Message: err.Error()}
 	}
-	if t, err := sharepath.Parse(req.Name); err != nil || t.IsRoot() || t.PerNamespace() || t.String() != req.Name || containsSlash(req.Name) {
-		return Result{Outcome: Failed, Message: fmt.Sprintf("invalid directory name %q", req.Name)}
+	if err := sharepath.CheckSegment(req.Name); err != nil {
+		return Result{Outcome: Failed, Message: fmt.Sprintf("invalid directory name %q: %v", req.Name, err)}
+	}
+	if req.UID < 0 || req.GID < 0 {
+		return Result{Outcome: Failed, Message: "uid and gid must not be negative"}
 	}
 
 	parent, err := unix.Open(req.Root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
@@ -84,45 +101,70 @@ func Run(req Request) Result {
 		return Result{Outcome: InsecureParent, Message: fmt.Sprintf(
 			"the parent directory must be owned by root and not writable by group or others (uid %d, mode %04o)", pst.Uid, uint32(pst.Mode)&permMask)}
 	}
+	removeLeftovers(parent)
 
-	for attempt := 0; attempt < 2; attempt++ {
-		fd, err := unix.Openat(parent, req.Name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		switch {
-		case err == nil:
-			res := finishOrReport(fd, req, mode)
-			unix.Close(fd)
-			return res
-		case errors.Is(err, unix.ENOENT):
-			// Mode 0000 and owned by root until it is complete.
-			if err := unix.Mkdirat(parent, req.Name, 0); err != nil && !errors.Is(err, unix.EEXIST) {
-				return fromErrno("creating the directory", err)
-			}
-		case errors.Is(err, unix.ELOOP), errors.Is(err, unix.ENOTDIR):
-			return Result{Outcome: NotADirectory, Message: fmt.Sprintf("%s exists and is not a directory (a symlink or a file)", req.Name)}
-		default:
-			return fromErrno("opening the directory", err)
-		}
+	if res, ok := existing(parent, req.Name); ok {
+		return res
 	}
-	return Result{Outcome: Failed, Message: "the directory appeared and disappeared while it was being created"}
+	tmp, err := tempName()
+	if err != nil {
+		return Result{Outcome: Failed, Message: err.Error()}
+	}
+	if err := unix.Mkdirat(parent, tmp, 0o700); err != nil {
+		return fromErrno("creating the directory", err)
+	}
+	res := finish(parent, tmp, req, mode)
+	if res.Outcome != Created {
+		_ = unix.Unlinkat(parent, tmp, unix.AT_REMOVEDIR)
+	}
+	return res
 }
 
-// finishOrReport completes a directory this preparer created (or an interrupted earlier run
-// did), or reports an existing one unchanged.
-func finishOrReport(fd int, req Request, mode uint32) Result {
+// existing reports on a directory already under the final name. It is never changed.
+func existing(parent int, name string) (Result, bool) {
+	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	switch {
+	case err == nil:
+		defer unix.Close(fd)
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil {
+			return fromErrno("checking the directory", err), true
+		}
+		return observed(Exists, &st, ""), true
+	case errors.Is(err, unix.ENOENT):
+		return Result{}, false
+	case errors.Is(err, unix.ELOOP), errors.Is(err, unix.ENOTDIR):
+		return Result{Outcome: NotADirectory, Message: fmt.Sprintf("%s exists and is not a directory (a symlink or a file)", name)}, true
+	case errors.Is(err, unix.EACCES):
+		// Exists but this process may not open it (for example mode 0700 for another owner).
+		var st unix.Stat_t
+		if err := unix.Fstatat(parent, name, &st, unix.AT_SYMLINK_NOFOLLOW); err == nil && st.Mode&unix.S_IFMT == unix.S_IFDIR {
+			return observed(Exists, &st, ""), true
+		}
+		return fromErrno("opening the directory", err), true
+	default:
+		return fromErrno("opening the directory", err), true
+	}
+}
+
+// finish gives the temporary directory its mode and owner, checks them, and renames it into
+// place without replacing anything.
+func finish(parent int, tmp string, req Request, mode uint32) Result {
+	fd, err := unix.Openat(parent, tmp, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fromErrno("opening the new directory", err)
+	}
+	defer unix.Close(fd)
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
-		return fromErrno("checking the directory", err)
+		return fromErrno("checking the new directory", err)
 	}
-	if !(st.Uid == 0 && uint32(st.Mode)&permMask == 0) {
-		return observed(Exists, &st, "")
+	if st.Uid != 0 {
+		return Result{Outcome: Failed, Message: fmt.Sprintf("the new directory is owned by uid %d, not root: is root squash on for this node?", st.Uid)}
 	}
-	if empty, err := isEmpty(fd); err != nil {
-		return fromErrno("listing the directory", err)
-	} else if !empty {
-		return observed(Exists, &st, "mode 0000 but not empty: left unchanged")
-	}
-	// Mode before owner: changing a root-owned directory's mode needs no capability, while
-	// changing it after handing it to another uid would need CAP_FOWNER.
+	// Mode before owner: a root-owned directory's mode, setgid included, needs no capability;
+	// after the hand-over it would need CAP_FOWNER. A setgid parent's inherited bit is
+	// overwritten here.
 	if err := unix.Fchmod(fd, mode); err != nil {
 		return fromErrno("setting the mode", err)
 	}
@@ -130,12 +172,47 @@ func finishOrReport(fd int, req Request, mode uint32) Result {
 		return fromErrno("setting the owner", err)
 	}
 	if err := unix.Fstat(fd, &st); err != nil {
-		return fromErrno("checking the directory", err)
+		return fromErrno("checking the new directory", err)
 	}
-	if uint32(st.Mode)&permMask != mode {
-		return observed(Failed, &st, fmt.Sprintf("mode is %04o after chown, wanted %04o", uint32(st.Mode)&permMask, mode))
+	if int(st.Uid) != req.UID || int(st.Gid) != req.GID || uint32(st.Mode)&permMask != mode {
+		return observed(Failed, &st, fmt.Sprintf("after chown the directory is %d:%d %04o, wanted %d:%d %04o",
+			st.Uid, st.Gid, uint32(st.Mode)&permMask, req.UID, req.GID, mode))
+	}
+	if err := renameNoReplace(parent, tmp, req.Name); err != nil {
+		if errors.Is(err, unix.EEXIST) || errors.Is(err, unix.ENOTEMPTY) {
+			// Created by someone else meanwhile: report theirs, discard ours.
+			if res, ok := existing(parent, req.Name); ok {
+				return res
+			}
+		}
+		return fromErrno("moving the directory into place", err)
 	}
 	return observed(Created, &st, "")
+}
+
+// removeLeftovers removes empty temporary directories of interrupted runs. rmdir removes only
+// empty directories, so nothing a tenant could have written is lost.
+func removeLeftovers(parent int) {
+	dup, err := unix.Dup(parent)
+	if err != nil {
+		return
+	}
+	f := os.NewFile(uintptr(dup), "parent")
+	defer f.Close()
+	names, _ := f.Readdirnames(-1)
+	for _, n := range names {
+		if strings.HasPrefix(n, TempPrefix) {
+			_ = unix.Unlinkat(parent, n, unix.AT_REMOVEDIR)
+		}
+	}
+}
+
+func tempName() (string, error) {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return TempPrefix + hex.EncodeToString(b), nil
 }
 
 func observed(outcome string, st *unix.Stat_t, msg string) Result {
@@ -143,21 +220,8 @@ func observed(outcome string, st *unix.Stat_t, msg string) Result {
 		Mode: fmt.Sprintf("%04o", uint32(st.Mode)&permMask)}
 }
 
-func isEmpty(fd int) (bool, error) {
-	dup, err := unix.Dup(fd)
-	if err != nil {
-		return false, err
-	}
-	f := os.NewFile(uintptr(dup), "dir")
-	defer f.Close()
-	names, err := f.Readdirnames(1)
-	if errors.Is(err, io.EOF) {
-		return true, nil
-	}
-	return len(names) == 0, err
-}
-
-func parseMode(s string) (uint32, error) {
+// ParseMode parses an octal mode of permission bits and optionally setgid.
+func ParseMode(s string) (uint32, error) {
 	m, err := strconv.ParseUint(s, 8, 32)
 	if err != nil {
 		return 0, fmt.Errorf("mode %q is not octal", s)
@@ -171,16 +235,7 @@ func parseMode(s string) (uint32, error) {
 func fromErrno(what string, err error) Result {
 	if errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM) {
 		return Result{Outcome: PermissionDenied, Message: fmt.Sprintf(
-			"%s: %v (is root squash on for this node? the preparer node must be exempt)", what, err)}
+			"%s: %v (root squash on the preparer's node, or permissions of the parent)", what, err)}
 	}
 	return Result{Outcome: Failed, Message: fmt.Sprintf("%s: %v", what, err)}
-}
-
-func containsSlash(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '/' {
-			return true
-		}
-	}
-	return false
 }

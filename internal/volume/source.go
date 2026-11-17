@@ -106,7 +106,8 @@ func (s *Source) Identity() (fs string, base string) {
 	var b strings.Builder
 	b.WriteString(s.Profile.Name)
 	for _, k := range keys {
-		b.WriteString("|" + k + "=" + s.VolumeAttributes[k])
+		// DNS names are case-insensitive and may end in a dot.
+		b.WriteString("|" + k + "=" + strings.TrimSuffix(strings.ToLower(s.VolumeAttributes[k]), "."))
 	}
 	return b.String(), s.subPathBase()
 }

@@ -53,6 +53,9 @@ func Parse(p string) (Template, error) {
 	return Template{raw: p}, nil
 }
 
+// CheckSegment validates one literal path segment (no placeholder).
+func CheckSegment(s string) error { return checkSegment(s, false) }
+
 func checkSegment(s string, placeholderOK bool) error {
 	switch {
 	case s == "":

@@ -107,9 +107,7 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(SetupIndexes(ctx, mgr)).To(Succeed())
 	recorder := mgr.GetEventRecorder("sharedfs")
-	Expect((&ShareReconciler{
-		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: recorder,
-	}).SetupWithManager(mgr)).To(Succeed())
+	Expect((&ShareReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()}).SetupWithManager(mgr)).To(Succeed())
 	Expect((&ProvisionerReconciler{
 		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: recorder,
 		RevocationGracePeriod: gracePeriod,
@@ -117,7 +115,7 @@ var _ = BeforeSuite(func() {
 	Expect((&DirectoryReconciler{Client: mgr.GetClient(), Preparer: PreparerConfig{
 		Namespace: controllerNamespace, Image: preparerImage, ServiceAccount: "sharedfs-preparer",
 	}}).SetupWithManager(mgr)).To(Succeed())
-	Expect((&ReclaimReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()}).SetupWithManager(mgr)).To(Succeed())
+	Expect((&ReclaimReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr)).To(Succeed())
 	go func() {
 		defer GinkgoRecover()
 		Expect(mgr.Start(ctx)).To(Succeed())

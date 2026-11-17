@@ -197,14 +197,14 @@ func main() {
 	recorder := mgr.GetEventRecorder("sharedfs")
 	for name, r := range map[string]interface{ SetupWithManager(ctrl.Manager) error }{
 		"filesystemshare": &controller.ShareReconciler{
-			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: recorder,
+			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(),
 		},
 		"provisioner": &controller.ProvisionerReconciler{
 			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: recorder,
 			RevocationGracePeriod: revocationGracePeriod,
 		},
 		"directory": &controller.DirectoryReconciler{Client: mgr.GetClient(), Preparer: preparer},
-		"reclaim":   &controller.ReclaimReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()},
+		"reclaim":   &controller.ReclaimReconciler{Client: mgr.GetClient()},
 	} {
 		if err := r.SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", name)
