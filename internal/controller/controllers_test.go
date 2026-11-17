@@ -55,6 +55,10 @@ func ensureDrivers() {
 			Expect(err).NotTo(HaveOccurred())
 		}
 	}
+	adminNS := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "fs-admin"}}
+	if err := k8sClient.Create(ctx, adminNS); err != nil && !apierrors.IsAlreadyExists(err) {
+		Expect(err).NotTo(HaveOccurred())
+	}
 	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "sharedfs-preparer", Namespace: controllerNamespace}}
 	if err := k8sClient.Create(ctx, sa); err != nil && !apierrors.IsAlreadyExists(err) {
 		Expect(err).NotTo(HaveOccurred())
@@ -240,10 +244,12 @@ var _ = Describe("FilesystemShare API", func() {
 		}
 	})
 
-	It("refuses provision on the root", func() {
-		s := share(uniq("root"), "none", "/", grant("x", sharedfsv1alpha1.AccessReadOnly))
-		s.Spec.Provision = &sharedfsv1alpha1.Provision{GID: 1, Mode: "2770"}
-		Expect(apierrors.IsInvalid(k8sClient.Create(ctx, s))).To(BeTrue())
+	It("refuses provision on the root and on a top-level directory", func() {
+		for _, p := range []string{"/", "{namespace}", "teams"} {
+			s := share(uniq("root"), "none", p, grant("x", sharedfsv1alpha1.AccessReadOnly))
+			s.Spec.Provision = &sharedfsv1alpha1.Provision{GID: 1, Mode: "2770"}
+			Expect(apierrors.IsInvalid(k8sClient.Create(ctx, s))).To(BeTrue(), "path %q", p)
+		}
 	})
 
 	It("keeps everything but the grants immutable and refuses empty selectors", func() {
@@ -289,6 +295,14 @@ var _ = Describe("FilesystemShare", func() {
 			Expect(*sc.ReclaimPolicy).To(Equal(corev1.PersistentVolumeReclaimDelete))
 			Expect(sc.Parameters[sharedfsv1alpha1.ParameterShareUID]).To(Equal(string(s.UID)))
 		}
+	})
+
+	It("is not Ready on a source reserved for a namespace that does not exist", func() {
+		src := sourcePV(uniq("src"))
+		src.Spec.ClaimRef.Namespace = uniq("missing")
+		s := share(uniq("ds"), src.Name, "datasets", grant("a", sharedfsv1alpha1.AccessReadOnly))
+		create(src, s)
+		Eventually(readyOf(s), timeout, interval).Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonSourceUnreserved))
 	})
 
 	It("is not Ready on an unreserved source", func() {
@@ -514,6 +528,26 @@ var _ = Describe("Provisioner", func() {
 		}, timeout, interval).Should(BeTrue())
 	})
 
+	It("holds revocation while the share pauses it", func() {
+		src := sourcePV(uniq("src"))
+		s := share(uniq("ds"), src.Name, "datasets", grant("pz", sharedfsv1alpha1.AccessReadOnly))
+		s.Annotations = map[string]string{sharedfsv1alpha1.AnnotationPauseRevocation: "true"}
+		ns := namespace("pz")
+		create(src, s, ns)
+		readyShare(s)
+		pvc := claim(ns.Name, s.Name+"-ro")
+		create(pvc)
+		bind(pvc, provisioned(pvc))
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ns), ns)).To(Succeed())
+		ns.Labels[grantKey] = "nope"
+		Expect(k8sClient.Update(ctx, ns)).To(Succeed())
+		Eventually(eventReasons(pvc), timeout, interval).Should(ContainElement(sharedfsv1alpha1.EventRevocationHeld))
+		Consistently(func() bool {
+			_ = k8sClient.Get(ctx, client.ObjectKeyFromObject(pvc), pvc)
+			return pvc.DeletionTimestamp.IsZero()
+		}, gracePeriod+2*time.Second, interval).Should(BeTrue())
+	})
+
 	It("deletes a Released volume and nothing else", func() {
 		src := sourcePV(uniq("src"))
 		s := share(uniq("ds"), src.Name, "datasets", grant("rel", sharedfsv1alpha1.AccessReadOnly))
@@ -601,7 +635,7 @@ var _ = Describe("Directories", func() {
 
 	It("records a failure, retries with backoff, and keeps the claim Pending", func() {
 		src := sourcePV(uniq("src"))
-		s := share(uniq("ck"), src.Name, "{namespace}", grant("fail", sharedfsv1alpha1.AccessReadWrite))
+		s := share(uniq("ck"), src.Name, "fail/{namespace}", grant("fail", sharedfsv1alpha1.AccessReadWrite))
 		s.Spec.Provision = &sharedfsv1alpha1.Provision{GID: 1000, Mode: "2770"}
 		ns := namespace("fail")
 		create(src, s, ns)

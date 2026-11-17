@@ -159,7 +159,7 @@ type FilesystemShareStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=fss,categories=sharedfs
-// +kubebuilder:validation:XValidation:rule="!has(self.spec.provision) || self.spec.path != '/'",message="provision needs a path below the root: the root exists already"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.provision) || (self.spec.path != '/' && self.spec.path.contains('/'))",message="provision needs a path of two segments or more: the preparer mounts the parent read-write, and the parent of a top-level directory is the whole file system"
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 250",message="name must be at most 250 characters: the StorageClasses are named <name>-rw and <name>-ro"
 // +kubebuilder:printcolumn:name="Volume",type=string,JSONPath=`.spec.persistentVolumeRef.name`
 // +kubebuilder:printcolumn:name="Path",type=string,JSONPath=`.spec.path`

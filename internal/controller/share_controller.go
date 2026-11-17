@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 
 	sharedfsv1alpha1 "github.com/littlemex/sharedfs/api/v1alpha1"
 	"github.com/littlemex/sharedfs/internal/driver"
+	"github.com/littlemex/sharedfs/internal/metrics"
 	"github.com/littlemex/sharedfs/internal/sharepath"
 	"github.com/littlemex/sharedfs/internal/volume"
 )
@@ -90,6 +92,7 @@ func (r *ShareReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 	setCondition(&share.Status.Conditions, share.Generation, sharedfsv1alpha1.ConditionReady,
 		reason == sharedfsv1alpha1.ReasonResolved, reason, msg)
+	metrics.SetShareReady(share.Name, strconv.FormatBool(reason == sharedfsv1alpha1.ReasonResolved), reason)
 	return ctrl.Result{}, r.updateStatus(ctx, &share, before)
 }
 
@@ -127,6 +130,17 @@ func (r *ShareReconciler) check(ctx context.Context, share *sharedfsv1alpha1.Fil
 	if !src.Reserved {
 		return sharedfsv1alpha1.ReasonSourceUnreserved, fmt.Sprintf(
 			"PersistentVolume %s is neither bound nor reserved with claimRef, so any namespace could bind it directly and skip the grants; reserve it", pv.Name), nil
+	}
+	if !src.Bound && src.ReservedFor != "" {
+		// Reserved by name only: whoever creates that namespace and a claim of that name takes
+		// the whole file system.
+		var ns corev1.Namespace
+		if err := r.Get(ctx, types.NamespacedName{Name: src.ReservedFor}, &ns); apierrors.IsNotFound(err) {
+			return sharedfsv1alpha1.ReasonSourceUnreserved, fmt.Sprintf(
+				"PersistentVolume %s is reserved for namespace %s, which does not exist: create it as an admin namespace, or bind the volume", pv.Name, src.ReservedFor), nil
+		} else if err != nil {
+			return "", "", err
+		}
 	}
 	if reason, msg, err := r.checkDriver(ctx, src.Profile.Name); err != nil || reason != "" {
 		return reason, msg, err
@@ -389,6 +403,7 @@ func (r *ShareReconciler) finalize(ctx context.Context, share *sharedfsv1alpha1.
 				len(volumes), strings.Join(claims, ", ")))
 		return client.IgnoreNotFound(r.updateStatus(ctx, share, before))
 	}
+	metrics.ForgetShare(share.Name)
 	patch := client.MergeFrom(share.DeepCopy())
 	controllerutil.RemoveFinalizer(share, sharedfsv1alpha1.Finalizer)
 	return client.IgnoreNotFound(r.Patch(ctx, share, patch))

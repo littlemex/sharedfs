@@ -66,6 +66,7 @@ const (
 	EventProvisioned        = "Provisioned"
 	EventRevoking           = "Revoking"
 	EventRevoked            = "Revoked"
+	EventRevocationHeld     = "RevocationHeld"
 )
 
 // Names sharedfs puts on the objects it manages.
@@ -95,6 +96,9 @@ const (
 	// can edit, while its claim's namespace is not granted: the RFC 3339 time after which the
 	// claim is deleted if the grant is still missing.
 	AnnotationWithdrawAfter = Group + "/withdraw-after"
+	// AnnotationPauseRevocation on a FilesystemShare holds every revocation of its claims, for
+	// an admin who sees a grant change go wrong.
+	AnnotationPauseRevocation = Group + "/pause-revocation"
 	// AnnotationAllowOverlap on a FilesystemShare exempts it from the overlap guard, for an
 	// admin's own root share.
 	AnnotationAllowOverlap = Group + "/allow-overlap"

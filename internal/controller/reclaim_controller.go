@@ -9,6 +9,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/littlemex/sharedfs/internal/metrics"
 	"github.com/littlemex/sharedfs/internal/volume"
 )
 
@@ -40,6 +41,7 @@ func (r *ReclaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	err := r.Delete(ctx, &pv, client.Preconditions{UID: &pv.UID})
 	switch {
 	case err == nil:
+		metrics.Reclaimed.Inc()
 		logf.FromContext(ctx).Info("deleted released volume", "pv", pv.Name)
 	case apierrors.IsNotFound(err), apierrors.IsConflict(err):
 	default:

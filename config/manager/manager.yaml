@@ -26,7 +26,7 @@ spec:
     matchLabels:
       control-plane: controller-manager
       app.kubernetes.io/name: sharedfs
-  replicas: 1
+  replicas: 2
   template:
     metadata:
       annotations:
@@ -35,30 +35,23 @@ spec:
         control-plane: controller-manager
         app.kubernetes.io/name: sharedfs
     spec:
-      # TODO(user): Uncomment the following code to configure the nodeAffinity expression
-      # according to the platforms which are supported by your solution.
-      # It is considered best practice to support multiple architectures. You can
-      # build your manager image using the makefile target docker-buildx.
-      # affinity:
-      #   nodeAffinity:
-      #     requiredDuringSchedulingIgnoredDuringExecution:
-      #       nodeSelectorTerms:
-      #         - matchExpressions:
-      #           - key: kubernetes.io/arch
-      #             operator: In
-      #             values:
-      #               - amd64
-      #               - arm64
-      #               - ppc64le
-      #               - s390x
-      #           - key: kubernetes.io/os
-      #             operator: In
-      #             values:
-      #               - linux
+      # Two replicas on different nodes: the standby takes over the leader lease when the
+      # leader's node goes away. Only the leader reconciles.
+      priorityClassName: system-cluster-critical
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            control-plane: controller-manager
+            app.kubernetes.io/name: sharedfs
+      tolerations:
+      - {key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute, tolerationSeconds: 30}
+      - {key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 30}
       securityContext:
-        # Projects are configured by default to adhere to the "restricted" Pod Security Standards.
-        # This ensures that deployments meet the highest security requirements for Kubernetes.
-        # For more details, see: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
+        # The controller itself meets Pod Security "restricted"; the namespace is "baseline"
+        # only for preparer pods.
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
@@ -101,15 +94,14 @@ spec:
             port: 8081
           initialDelaySeconds: 5
           periodSeconds: 10
-        # TODO(user): Configure the resources accordingly based on the project requirements.
-        # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+        # Measured with 200 claims and their volumes cached; raise the limit with the number of
+        # PersistentVolumeClaims and PersistentVolumes in the cluster (all are cached).
         resources:
           limits:
-            cpu: 500m
-            memory: 128Mi
+            memory: 512Mi
           requests:
-            cpu: 10m
-            memory: 64Mi
+            cpu: 50m
+            memory: 128Mi
         volumeMounts: []
       volumes: []
       serviceAccountName: controller-manager

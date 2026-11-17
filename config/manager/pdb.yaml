@@ -1,0 +1,30 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: controller-manager
+  namespace: system
+  labels:
+    app.kubernetes.io/name: sharedfs
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: sharedfs
+---
+# Preparer pods need no network: they mount through the node's Lustre client and report through
+# their termination message.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: preparer-deny-all
+  namespace: system
+  labels:
+    app.kubernetes.io/name: sharedfs
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  podSelector:
+    matchExpressions:
+    - {key: sharedfs.littlemex.github.io/internal, operator: Exists}
+  policyTypes: [Ingress, Egress]

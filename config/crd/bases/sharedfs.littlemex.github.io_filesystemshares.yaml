@@ -338,8 +338,10 @@ spec:
         - spec
         type: object
         x-kubernetes-validations:
-        - message: 'provision needs a path below the root: the root exists already'
-          rule: '!has(self.spec.provision) || self.spec.path != ''/'''
+        - message: 'provision needs a path of two segments or more: the preparer mounts
+            the parent read-write, and the parent of a top-level directory is the
+            whole file system'
+          rule: '!has(self.spec.provision) || (self.spec.path != ''/'' && self.spec.path.contains(''/''))'
         - message: 'name must be at most 250 characters: the StorageClasses are named
             <name>-rw and <name>-ro'
           rule: size(self.metadata.name) <= 250

@@ -26,6 +26,7 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -68,8 +69,18 @@ func main() {
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
 	var revocationGracePeriod time.Duration
-	flag.DurationVar(&revocationGracePeriod, "revocation-grace-period", 30*time.Second,
-		"How long a claim must stay ungranted before its PersistentVolumeClaim is deleted.")
+	flag.DurationVar(&revocationGracePeriod, "revocation-grace-period", 15*time.Minute,
+		"How long a claim must stay ungranted before its PersistentVolumeClaim is deleted. "+
+			"Long enough to undo a mistaken label or grant change.")
+	var revocationsPerMinute float64
+	flag.Float64Var(&revocationsPerMinute, "revocations-per-minute", 30,
+		"Most claims deleted by revocation per minute, cluster-wide (bursts of the same size).")
+	var concurrency int
+	flag.IntVar(&concurrency, "provisioner-concurrency", 4, "Claims provisioned or revoked at once.")
+	var qps float64
+	var burst int
+	flag.Float64Var(&qps, "kube-api-qps", 50, "Queries per second to the API server.")
+	flag.IntVar(&burst, "kube-api-burst", 100, "Burst of queries to the API server.")
 	var preparerImage, preparerServiceAccount, preparerNodeSelector, preparerTolerations string
 	flag.StringVar(&preparerImage, "preparer-image", "",
 		"Image of preparer pods. Empty means this controller's own image, read from its pod.")
@@ -158,11 +169,17 @@ func main() {
 		setupLog.Error(nil, "POD_NAMESPACE must name the controller's namespace")
 		os.Exit(1)
 	}
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restConfig := ctrl.GetConfigOrDie()
+	restConfig.QPS, restConfig.Burst = float32(qps), burst
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme: scheme,
-		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
-			&corev1.Pod{}: {Namespaces: map[string]cache.Config{podNamespace: {}}},
-		}},
+		Cache: cache.Options{
+			ByObject: map[client.Object]cache.ByObject{
+				&corev1.Pod{}: {Namespaces: map[string]cache.Config{podNamespace: {}}},
+			},
+			// Claims and volumes of the whole cluster are cached; their managed fields are not needed.
+			DefaultTransform: cache.TransformStripManagedFields(),
+		},
 		Metrics:                metricsServerOptions,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
@@ -202,7 +219,9 @@ func main() {
 		},
 		"provisioner": &controller.ProvisionerReconciler{
 			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: recorder,
-			RevocationGracePeriod: revocationGracePeriod,
+			RevocationGracePeriod:   revocationGracePeriod,
+			RevocationLimiter:       rate.NewLimiter(rate.Limit(revocationsPerMinute/60), max(int(revocationsPerMinute), 1)),
+			MaxConcurrentReconciles: concurrency,
 		},
 		"directory": &controller.DirectoryReconciler{Client: mgr.GetClient(), Preparer: preparer},
 		"reclaim":   &controller.ReclaimReconciler{Client: mgr.GetClient()},

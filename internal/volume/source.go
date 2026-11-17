@@ -28,6 +28,8 @@ type Source struct {
 	Reserved bool
 	// ReservedFor is the namespace the source is bound or reserved to, if any.
 	ReservedFor string
+	// Bound reports whether the reservation names a claim by UID, as a bound volume does.
+	Bound bool
 }
 
 // SourceError is why a source PersistentVolume cannot be distributed. Reason is a
@@ -76,7 +78,7 @@ func Resolve(pv *corev1.PersistentVolume) (*Source, error) {
 		NodeAffinity:     pv.Spec.NodeAffinity.DeepCopy(),
 	}
 	if ref := pv.Spec.ClaimRef; ref != nil && ref.Name != "" {
-		s.Reserved, s.ReservedFor = true, ref.Namespace
+		s.Reserved, s.ReservedFor, s.Bound = true, ref.Namespace, ref.UID != ""
 	}
 	return s, nil
 }

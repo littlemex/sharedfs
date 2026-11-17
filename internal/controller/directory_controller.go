@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	sharedfsv1alpha1 "github.com/littlemex/sharedfs/api/v1alpha1"
+	"github.com/littlemex/sharedfs/internal/metrics"
 	"github.com/littlemex/sharedfs/internal/prepare"
 	"github.com/littlemex/sharedfs/internal/sharepath"
 	"github.com/littlemex/sharedfs/internal/volume"
@@ -96,6 +97,7 @@ func (r *DirectoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				// internal claim and volume, which mount the parent read-write, and retry later.
 				dir.Status.Failures++
 				dir.Status.LastFailureTime = &metav1.Time{Time: time.Now()}
+				metrics.PreparerOutcomes.WithLabelValues(sharedfsv1alpha1.ReasonPreparerNotCreated).Inc()
 				setCondition(&dir.Status.Conditions, dir.Generation, sharedfsv1alpha1.ConditionPrepared, false,
 					sharedfsv1alpha1.ReasonPreparerNotCreated, truncate(err.Error()))
 				if err := r.updateStatus(ctx, &dir, before); err != nil {
@@ -140,6 +142,7 @@ func (r *DirectoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		dir.Status.LastFailureTime = &metav1.Time{Time: time.Now()}
 	}
 	dir.Status.LastPreparer = pod.UID
+	metrics.PreparerOutcomes.WithLabelValues(res.Outcome).Inc()
 	setCondition(&dir.Status.Conditions, dir.Generation, sharedfsv1alpha1.ConditionPrepared, ok, res.Outcome, truncate(msg))
 	if err := r.updateStatus(ctx, &dir, before); err != nil {
 		return ctrl.Result{}, err

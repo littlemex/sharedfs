@@ -16,12 +16,16 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"golang.org/x/time/rate"
+
 	sharedfsv1alpha1 "github.com/littlemex/sharedfs/api/v1alpha1"
+	"github.com/littlemex/sharedfs/internal/metrics"
 	"github.com/littlemex/sharedfs/internal/sharepath"
 	"github.com/littlemex/sharedfs/internal/volume"
 )
@@ -41,6 +45,10 @@ type ProvisionerReconciler struct {
 
 	// RevocationGracePeriod is how long a claim stays after its namespace lost the grant.
 	RevocationGracePeriod time.Duration
+	// RevocationLimiter bounds how fast claims are deleted across the whole cluster.
+	RevocationLimiter *rate.Limiter
+	// MaxConcurrentReconciles is how many claims are handled at once.
+	MaxConcurrentReconciles int
 }
 
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;delete
@@ -134,12 +142,17 @@ func (r *ProvisionerReconciler) provision(ctx context.Context, pvc *corev1.Persi
 		ExpandedPath: expanded, ClassName: *pvc.Spec.StorageClassName,
 	})
 	if err := r.Create(ctx, pv); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return ctrl.Result{}, nil
+		}
 		if apierrors.IsInvalid(err) {
 			return r.pending(pvc, sharedfsv1alpha1.EventUnsupportedClaim, "the volume for this claim is invalid: "+err.Error())
 		}
 		// Already provisioned; the PV controller has yet to bind it.
 		return ctrl.Result{}, client.IgnoreAlreadyExists(err)
 	}
+	metrics.Provisioned.Inc()
+	metrics.ProvisionLatency.Observe(time.Since(pvc.CreationTimestamp.Time).Seconds())
 	r.Recorder.Eventf(pvc, pv, corev1.EventTypeNormal, sharedfsv1alpha1.EventProvisioned, "Provision",
 		"provisioned %s from FilesystemShare %s, path %s, %s", pv.Name, share.Name, expanded, access)
 	return ctrl.Result{}, nil
@@ -235,6 +248,7 @@ func unsupported(pvc *corev1.PersistentVolumeClaim) string {
 }
 
 func (r *ProvisionerReconciler) pending(pvc *corev1.PersistentVolumeClaim, reason, msg string) (ctrl.Result, error) {
+	metrics.ClaimsPending.WithLabelValues(reason).Inc()
 	r.Recorder.Eventf(pvc, nil, corev1.EventTypeWarning, reason, "Provision", "%s", msg)
 	return ctrl.Result{RequeueAfter: eventRefresh}, nil
 }
@@ -242,7 +256,9 @@ func (r *ProvisionerReconciler) pending(pvc *corev1.PersistentVolumeClaim, reaso
 // reconcileBound withdraws a claim bound to a sharedfs volume once its namespace has gone
 // without the grant for the grace period. The deadline is kept on the PersistentVolume, which
 // tenants cannot edit, and checked again against live objects before the claim is deleted.
-// A share that is not Ready or is being deleted does not withdraw claims: it only stops new ones.
+// A share that is not Ready only stops new claims. Revocation is held, never executed, when the
+// share to judge by is missing or was replaced, or when the share pauses revocation; and it is
+// rate-limited, so one mistaken label change cannot delete every claim at once.
 func (r *ProvisionerReconciler) reconcileBound(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (ctrl.Result, error) {
 	var pv corev1.PersistentVolume
 	if err := r.Get(ctx, types.NamespacedName{Name: pvc.Spec.VolumeName}, &pv); err != nil {
@@ -251,18 +267,25 @@ func (r *ProvisionerReconciler) reconcileBound(ctx context.Context, pvc *corev1.
 	if !volume.ProvisionedBySharedfs(&pv) || pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.UID != pvc.UID {
 		return ctrl.Result{}, nil
 	}
-	granted, err := r.granted(ctx, r.Client, pvc, &pv)
+	v, err := r.verdict(ctx, r.Client, pvc, &pv)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	deadline, hasDeadline := pv.Annotations[sharedfsv1alpha1.AnnotationWithdrawAfter]
-	if granted {
+	switch {
+	case v.granted:
 		if !hasDeadline {
 			return ctrl.Result{}, nil
 		}
+		metrics.Revocations.WithLabelValues("cancelled").Inc()
 		patch := client.MergeFrom(pv.DeepCopy())
 		delete(pv.Annotations, sharedfsv1alpha1.AnnotationWithdrawAfter)
 		return ctrl.Result{}, client.IgnoreNotFound(r.Patch(ctx, &pv, patch))
+	case v.hold != "":
+		metrics.Revocations.WithLabelValues("held").Inc()
+		r.Recorder.Eventf(pvc, &pv, corev1.EventTypeWarning, sharedfsv1alpha1.EventRevocationHeld, "Revoke",
+			"revocation held: %s", v.hold)
+		return ctrl.Result{RequeueAfter: eventRefresh}, nil
 	}
 	if !hasDeadline {
 		at := time.Now().Add(r.RevocationGracePeriod).UTC().Truncate(time.Second)
@@ -271,6 +294,7 @@ func (r *ProvisionerReconciler) reconcileBound(ctx context.Context, pvc *corev1.
 		if err := r.Patch(ctx, &pv, patch); err != nil {
 			return ctrl.Result{}, client.IgnoreNotFound(err)
 		}
+		metrics.Revocations.WithLabelValues("scheduled").Inc()
 		r.Recorder.Eventf(pvc, &pv, corev1.EventTypeWarning, sharedfsv1alpha1.EventRevoking, "Revoke",
 			"namespace %s is no longer granted FilesystemShare %s; the claim is deleted after %s unless the grant returns",
 			pvc.Namespace, pv.Annotations[sharedfsv1alpha1.AnnotationShareName], at.Format(time.RFC3339))
@@ -279,17 +303,20 @@ func (r *ProvisionerReconciler) reconcileBound(ctx context.Context, pvc *corev1.
 	at, err := time.Parse(time.RFC3339, deadline)
 	if err != nil {
 		// Not ours to guess: restart the grace period.
-		at = time.Now().Add(r.RevocationGracePeriod)
 		patch := client.MergeFrom(pv.DeepCopy())
-		pv.Annotations[sharedfsv1alpha1.AnnotationWithdrawAfter] = at.UTC().Truncate(time.Second).Format(time.RFC3339)
+		pv.Annotations[sharedfsv1alpha1.AnnotationWithdrawAfter] = time.Now().Add(r.RevocationGracePeriod).UTC().Truncate(time.Second).Format(time.RFC3339)
 		return ctrl.Result{RequeueAfter: r.RevocationGracePeriod}, client.IgnoreNotFound(r.Patch(ctx, &pv, patch))
 	}
 	if wait := time.Until(at); wait > 0 {
 		return ctrl.Result{RequeueAfter: wait + time.Second}, nil
 	}
 	// The cache may lag a grant that was just restored: decide on live objects.
-	if granted, err := r.granted(ctx, r.APIReader, pvc, &pv); err != nil || granted {
-		return ctrl.Result{Requeue: granted}, err
+	if v, err := r.verdict(ctx, r.APIReader, pvc, &pv); err != nil || v.granted || v.hold != "" {
+		return ctrl.Result{RequeueAfter: time.Second}, err
+	}
+	if r.RevocationLimiter != nil && !r.RevocationLimiter.Allow() {
+		metrics.Revocations.WithLabelValues("ratelimited").Inc()
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	if err := r.Delete(ctx, pvc, client.Preconditions{UID: &pvc.UID}); err != nil {
 		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
@@ -297,43 +324,52 @@ func (r *ProvisionerReconciler) reconcileBound(ctx context.Context, pvc *corev1.
 		}
 		return ctrl.Result{}, err
 	}
+	metrics.Revocations.WithLabelValues("executed").Inc()
 	r.Recorder.Eventf(pvc, &pv, corev1.EventTypeWarning, sharedfsv1alpha1.EventRevoked, "Revoke",
 		"deleted: namespace %s lost its grant on FilesystemShare %s; running pods keep their mounts until they stop",
 		pvc.Namespace, pv.Annotations[sharedfsv1alpha1.AnnotationShareName])
 	return ctrl.Result{}, nil
 }
 
-// granted reports whether the claim's namespace is still granted the volume's access. A share
-// that is gone or replaced (another UID) grants nothing; the volume's access is read from the
-// volume itself.
-func (r *ProvisionerReconciler) granted(ctx context.Context, reader client.Reader, pvc *corev1.PersistentVolumeClaim, pv *corev1.PersistentVolume) (bool, error) {
+type verdict struct {
+	granted bool
+	// hold names why a revocation must not proceed even though no grant is found.
+	hold string
+}
+
+// verdict decides whether the claim's namespace is still granted the volume's access. The
+// volume's access is read from the volume itself; unknown is judged as ReadWrite.
+func (r *ProvisionerReconciler) verdict(ctx context.Context, reader client.Reader, pvc *corev1.PersistentVolumeClaim, pv *corev1.PersistentVolume) (verdict, error) {
+	name := pv.Annotations[sharedfsv1alpha1.AnnotationShareName]
 	var share sharedfsv1alpha1.FilesystemShare
-	err := reader.Get(ctx, types.NamespacedName{Name: pv.Annotations[sharedfsv1alpha1.AnnotationShareName]}, &share)
+	err := reader.Get(ctx, types.NamespacedName{Name: name}, &share)
 	if apierrors.IsNotFound(err) {
-		return false, nil
+		// The finalizer keeps a share while it has volumes, so it was removed by force: judging
+		// every claim of it ungranted would delete them all.
+		return verdict{hold: fmt.Sprintf("FilesystemShare %s is gone although this volume remains; delete the claim or recreate the share", name)}, nil
 	}
 	if err != nil {
-		return false, err
+		return verdict{}, err
 	}
 	if string(share.UID) != pv.Labels[sharedfsv1alpha1.LabelShareUID] {
-		return false, nil
+		return verdict{hold: fmt.Sprintf("FilesystemShare %s was recreated after this volume was provisioned from it; delete the claim to move it to the new share", name)}, nil
+	}
+	if share.Annotations[sharedfsv1alpha1.AnnotationPauseRevocation] == "true" {
+		return verdict{hold: fmt.Sprintf("FilesystemShare %s pauses revocation", name)}, nil
 	}
 	var ns corev1.Namespace
 	if err := reader.Get(ctx, types.NamespacedName{Name: pvc.Namespace}, &ns); err != nil {
-		return false, client.IgnoreNotFound(err)
+		return verdict{}, client.IgnoreNotFound(err)
 	}
 	access := sharedfsv1alpha1.Access(pv.Annotations[sharedfsv1alpha1.AnnotationAccess])
 	if access != sharedfsv1alpha1.AccessReadOnly {
-		// Unknown is judged as the stronger access.
 		access = sharedfsv1alpha1.AccessReadWrite
 	}
 	ok, err := grantFor(&share, &ns, access)
 	if err != nil {
-		// A grant that cannot be evaluated is not a reason to delete someone's claim.
-		logf.FromContext(ctx).Error(err, "evaluating grants", "share", share.Name)
-		return true, nil
+		return verdict{hold: fmt.Sprintf("the grants of FilesystemShare %s cannot be evaluated: %v", name, err)}, nil
 	}
-	return ok, nil
+	return verdict{granted: ok}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -345,6 +381,7 @@ func (r *ProvisionerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			builder.WithPredicates(shareChanged)).
 		Watches(&sharedfsv1alpha1.FilesystemShareDirectory{}, handler.EnqueueRequestsFromMapFunc(r.claimsOfDirectory)).
 		Watches(&corev1.PersistentVolume{}, handler.EnqueueRequestsFromMapFunc(claimOfPV)).
+		WithOptions(controller.Options{MaxConcurrentReconciles: max(r.MaxConcurrentReconciles, 1)}).
 		Named("provisioner").
 		Complete(r)
 }

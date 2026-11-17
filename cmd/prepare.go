@@ -80,7 +80,8 @@ func ownImage(pod *corev1.Pod) string {
 }
 
 // preparerConfig resolves where preparer pods run. The image defaults to the controller's own,
-// read from its pod, and pinned to the digest when the pod's status already reports one.
+// read from its pod and pinned to the digest it runs: a preparer never runs code other than the
+// controller's.
 func preparerConfig(ctx context.Context, c client.Reader, image, sa, nodeSelector, tolerations string) (controller.PreparerConfig, error) {
 	cfg := controller.PreparerConfig{
 		Namespace:      os.Getenv("POD_NAMESPACE"),
@@ -102,8 +103,11 @@ func preparerConfig(ctx context.Context, c client.Reader, image, sa, nodeSelecto
 				return cfg, fmt.Errorf("reading own pod for the preparer image: %w", err)
 			}
 			cfg.Image = ownImage(&pod)
-			if strings.Contains(cfg.Image, "@sha256:") || i == 30 {
+			if strings.Contains(cfg.Image, "@sha256:") {
 				break
+			}
+			if i == 60 {
+				return cfg, errors.New("own pod reports no image digest; set --preparer-image to an image by digest")
 			}
 			select {
 			case <-ctx.Done():
