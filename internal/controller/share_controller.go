@@ -72,13 +72,13 @@ func (r *ShareReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if reason == sharedfsv1alpha1.ReasonResolved {
-		if taken, err := r.ensureClasses(ctx, &share); err != nil {
-			return ctrl.Result{}, err
-		} else if taken != "" {
-			reason, msg = sharedfsv1alpha1.ReasonStorageClassTaken,
-				fmt.Sprintf("StorageClass %s exists and is not this share's; rename the share or remove that class", taken)
-		}
+	// The classes exist whatever the verdict, so a claim of a share that is not Ready is told
+	// why (ShareNotReady) instead of waiting on a StorageClass that does not exist.
+	if taken, err := r.ensureClasses(ctx, &share); err != nil {
+		return ctrl.Result{}, err
+	} else if taken != "" {
+		reason, msg = sharedfsv1alpha1.ReasonStorageClassTaken,
+			fmt.Sprintf("StorageClass %s exists and is not this share's; rename the share or remove that class", taken)
 	}
 	setCondition(&share.Status.Conditions, share.Generation, sharedfsv1alpha1.ConditionReady,
 		reason == sharedfsv1alpha1.ReasonResolved, reason, msg)

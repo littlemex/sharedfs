@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
-# End-to-end check of sharedfs on a real cluster with a real FSx file system.
+# End-to-end check of sharedfs on a real cluster with a real FSx for Lustre file system.
 #
 # Usage: test/e2e-eks/run.sh <source PV name> <node name>
-#   CTRL_NS / CTRL_DEPLOY  where the controller runs (step 5b stops and restarts it)
-#   source PV  an existing static PV of fsx.csi.aws.com or fsx.openzfs.csi.aws.com
-#   node       a node that can mount it; both probe pods run there (same-node rw and ro mounts)
+#   source PV  an existing static PV of fsx.csi.aws.com, reserved (claimRef set) or bound
+#   node       a node that can mount it; tenant pods run there
+#   CTRL_NS    the controller's namespace (default sharedfs-system)
+#   GRACE      the controller's --revocation-grace-period in seconds (default 30)
 #
-# Creates namespaces sfse2e-<id>-{rw,ro,none} and a SharedFilesystem sfse2e-<id>, and removes
-# them at the end. The source PV and the file system are only read; one directory
-# .sharedfs-e2e-<id> is written on the file system and removed.
+# Creates namespaces sfse2e-<id>-{admin,team,reader,none} and FilesystemShares sfse2e-<id>-*,
+# writes only below the directory sfse2e-<id> of the file system, and removes all of it at the
+# end. The source PV is only read.
 set -uo pipefail
 
 SRC=${1:?source PV}; NODE=${2:?node}
 ID=$(LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 5)
-P=sfse2e-$ID; NS_RW=$P-rw; NS_RO=$P-ro; NS_NONE=$P-none
+P=sfse2e-$ID
+NS_ADMIN=$P-admin; NS_TEAM=$P-team; NS_READER=$P-reader; NS_NONE=$P-none
 KEY=sharedfs-e2e/$P
-DIR=/shared/.sharedfs-e2e-$ID
 GRACE=${GRACE:-30}
-CTRL_NS=${CTRL_NS:-sharedfs-system}; CTRL_DEPLOY=${CTRL_DEPLOY:-sharedfs-controller-manager}
+CTRL_NS=${CTRL_NS:-sharedfs-system}
+G=sharedfs.littlemex.github.io
 PASS=0; FAIL=0
 
 ok()   { PASS=$((PASS+1)); echo "[PASS] $*"; }
@@ -26,11 +28,36 @@ step() { echo; echo "== $*"; }
 check() { local d=$1; shift; if "$@"; then ok "$d"; else ng "$d"; fi; }
 # wait_for <seconds> <command...>: poll until the command succeeds.
 wait_for() { local t=$1; shift; for _ in $(seq "$t"); do "$@" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
-cond() { kubectl -n "$1" get sfc "$2" -o jsonpath="{.status.conditions[?(@.type==\"$3\")].status}/{.status.conditions[?(@.type==\"$3\")].reason}"; }
-cond_is() { [ "$(cond "$1" "$2" "$3")" = "$4" ]; }
-pvc_phase_is() { [ "$(kubectl -n "$1" get pvc "$2" -o jsonpath='{.status.phase}' 2>/dev/null)" = "$3" ]; }
+ready() { kubectl get fss "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}/{.status.conditions[?(@.type=="Ready")].reason}'; }
+ready_is() { [ "$(ready "$1")" = "$2" ]; }
+phase_is() { [ "$(kubectl -n "$1" get pvc "$2" -o jsonpath='{.status.phase}' 2>/dev/null)" = "$3" ]; }
+event_seen() { kubectl -n "$1" get events --field-selector "involvedObject.name=$2,reason=$3" -o name 2>/dev/null | grep -q .; }
+running() { [ "$(kubectl -n "$1" get pod "$2" -o jsonpath='{.status.phase}' 2>/dev/null)" = Running ]; }
+sh_in() { kubectl -n "$1" exec "$2" -- sh -c "$3"; }
+not() { ! "$@"; }
 gone() { ! kubectl get "$@" >/dev/null 2>&1; }
-pod() { # pod <ns> <name> <claim>
+
+share() { # share <name> <path> <grants yaml> [provision yaml] [annotations yaml]
+  kubectl apply -f - >/dev/null <<EOF
+apiVersion: $G/v1alpha1
+kind: FilesystemShare
+metadata: {name: $1, annotations: {${5:-}}}
+spec:
+  persistentVolumeRef: {name: $SRC}
+  path: "$2"
+  grants: $3
+  ${4:-}
+EOF
+}
+pvc() { # pvc <ns> <name> <class> [accessMode]
+  kubectl apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: $2, namespace: $1}
+spec: {accessModes: [${4:-ReadWriteMany}], storageClassName: $3, resources: {requests: {storage: 1Gi}}}
+EOF
+}
+pod() { # pod <ns> <name> <claim> [uid] [gid]
   kubectl apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
@@ -39,6 +66,7 @@ spec:
   nodeSelector: {kubernetes.io/hostname: $NODE}
   terminationGracePeriodSeconds: 1
   restartPolicy: Never
+  securityContext: {runAsUser: ${4:-0}, runAsGroup: ${5:-0}, supplementalGroups: [${5:-0}]}
   containers:
   - name: c
     image: public.ecr.aws/docker/library/busybox:1.36
@@ -47,166 +75,149 @@ spec:
   volumes: [{name: v, persistentVolumeClaim: {claimName: $3}}]
 EOF
 }
-running() { [ "$(kubectl -n "$1" get pod "$2" -o jsonpath='{.status.phase}' 2>/dev/null)" = Running ]; }
-sh_in() { kubectl -n "$1" exec "$2" -- sh -c "$3"; }
 
+SRC_RV=$(kubectl get pv "$SRC" -o jsonpath='{.metadata.resourceVersion}')
 cleanup() {
   step cleanup
-  kubectl -n "$NS_RW" exec w -- rm -rf "$DIR" >/dev/null 2>&1
-  kubectl delete ns "$NS_RW" "$NS_RO" "$NS_NONE" --wait=false >/dev/null 2>&1
-  kubectl delete sfs "$P" --wait=false >/dev/null 2>&1
-  wait_for 180 gone sfs "$P"
-  echo "left over PVs: $(kubectl get pv -l sharedfs.littlemex.github.io/claim-uid -o name | wc -l | tr -d ' ') (all sharedfs PVs in the cluster)"
+  kubectl -n "$NS_ADMIN" exec root -- rm -rf "/shared/$P" >/dev/null 2>&1
+  kubectl delete ns "$NS_ADMIN" "$NS_TEAM" "$NS_READER" "$NS_NONE" --wait=false >/dev/null 2>&1
+  for s in $(kubectl get fss -o name 2>/dev/null | grep "/$P"); do kubectl delete "$s" --wait=false >/dev/null 2>&1; done
+  wait_for 240 sh -c "! kubectl get fss -o name | grep -q /$P"
+  echo "left over: shares $(kubectl get fss -o name | grep -c "/$P"), tenant PVs $(kubectl get pv -o name | grep -c '/sfs-[0-9a-f]\{8\}-'), preparer PVs $(kubectl get pv -o name | grep -c '/sfs-prep-')"
   echo "RESULT pass=$PASS fail=$FAIL"
 }
 trap cleanup EXIT
 
-step "setup: SharedFilesystem $P on $SRC (phase $(kubectl get pv "$SRC" -o jsonpath='{.status.phase}'))"
-for ns in "$NS_RW" "$NS_RO" "$NS_NONE"; do kubectl create ns "$ns" >/dev/null; done
-kubectl label ns "$NS_RW" "$KEY=rw" >/dev/null; kubectl label ns "$NS_RO" "$KEY=ro" >/dev/null
-kubectl apply -f - >/dev/null <<EOF
-apiVersion: sharedfs.littlemex.github.io/v1alpha1
-kind: SharedFilesystem
-metadata: {name: $P}
-spec:
-  persistentVolumeRef: {name: $SRC}
-  grants:
-  - {namespaceSelector: {matchLabels: {$KEY: rw}}, access: ReadWrite}
-  - {namespaceSelector: {matchLabels: {$KEY: ro}}, access: ReadOnly}
-EOF
-check "SharedFilesystem Ready on a source whose phase does not matter" wait_for 30 sh -c "[ \"\$(kubectl get sfs $P -o jsonpath='{.status.conditions[0].status}')\" = True ]"
-kubectl get sfs "$P"
+step "setup on $SRC (phase $(kubectl get pv "$SRC" -o jsonpath='{.status.phase}'))"
+for ns in "$NS_ADMIN" "$NS_TEAM" "$NS_READER" "$NS_NONE"; do kubectl create ns "$ns" >/dev/null; done
+kubectl label ns "$NS_ADMIN" "$KEY=admin" >/dev/null
+kubectl label ns "$NS_TEAM" "$KEY=team" >/dev/null
+kubectl label ns "$NS_READER" "$KEY=reader" >/dev/null
+sel() { echo "{namespaceSelector: {matchLabels: {$KEY: $1}}, access: $2}"; }
 
-step "1. read-write and read-only claims mount on one node"
-T0=$(date +%s)
-for pair in "$NS_RW:ReadWrite" "$NS_RO:ReadOnly"; do
-  kubectl apply -f - >/dev/null <<EOF
-apiVersion: sharedfs.littlemex.github.io/v1alpha1
-kind: SharedFilesystemClaim
-metadata: {name: data, namespace: ${pair%%:*}}
-spec: {filesystemRef: {name: $P}, access: ${pair##*:}}
-EOF
-done
-check "rw claim Ready" wait_for 60 cond_is "$NS_RW" data Ready True/Ready
-check "ro claim Ready" wait_for 60 cond_is "$NS_RO" data Ready True/Ready
-echo "seconds from creating the claims to both Ready: $(( $(date +%s) - T0 ))"
-pod "$NS_RW" w data; pod "$NS_RO" r data
-check "rw pod running" wait_for 120 running "$NS_RW" w
-check "ro pod running" wait_for 120 running "$NS_RO" r
+share "$P-root" "/" "[$(sel admin ReadWrite)]" "" "$G/allow-overlap: \"true\""
+check "admin root share Ready with allow-overlap" wait_for 60 ready_is "$P-root" True/Resolved
+pvc "$NS_ADMIN" root "$P-root-rw"
+check "admin claim Bound" wait_for 60 phase_is "$NS_ADMIN" root Bound
+pod "$NS_ADMIN" root root
+check "admin pod running" wait_for 180 running "$NS_ADMIN" root
 NONCE=$P-$(date +%s)
-check "rw pod writes a nonce" sh_in "$NS_RW" w "mkdir -p $DIR && echo $NONCE > $DIR/nonce"
-check "ro pod reads the same nonce" sh -c "[ \"\$(kubectl -n $NS_RO exec r -- cat $DIR/nonce)\" = $NONCE ]"
-check "ro pod cannot write (EROFS)" sh -c "kubectl -n $NS_RO exec r -- sh -c 'echo x > $DIR/from-ro' 2>&1 | grep -q 'Read-only file system'"
-sh_in "$NS_RO" r "grep ' /shared ' /proc/mounts"
-kubectl get pv -l sharedfs.littlemex.github.io/claim-uid -o custom-columns=NAME:.metadata.name,CLAIM:.spec.claimRef.namespace,OPTS:.spec.mountOptions,RECLAIM:.spec.persistentVolumeReclaimPolicy,STATUS:.status.phase | grep -E "NAME|$P"
+sh_in "$NS_ADMIN" root "mkdir -m 0755 /shared/$P && mkdir -m 0755 /shared/$P/data && echo $NONCE > /shared/$P/data/nonce && ln -s / /shared/$P/link"
+check "admin prepared the test tree" sh_in "$NS_ADMIN" root "[ -f /shared/$P/data/nonce ] && [ -L /shared/$P/link ]"
 
-step "2. an ungranted namespace gets nothing, and cannot take a reserved PV by name"
-kubectl apply -f - >/dev/null <<EOF
-apiVersion: sharedfs.littlemex.github.io/v1alpha1
-kind: SharedFilesystemClaim
-metadata: {name: data, namespace: $NS_NONE}
-spec: {filesystemRef: {name: $P}}
-EOF
-check "claim rejected NamespaceNotGranted" wait_for 30 cond_is "$NS_NONE" data Accepted False/NamespaceNotGranted
-RW_PV=$(kubectl -n "$NS_RW" get sfc data -o jsonpath='{.status.persistentVolumeName}')
-check "no PV generated for it" sh -c "[ -z \"\$(kubectl -n $NS_NONE get sfc data -o jsonpath='{.status.persistentVolumeName}')\" ]"
+step "1. a per-namespace directory is created by the preparer, then provisioned"
+share "$P-team" "$P/{namespace}" "[$(sel team ReadWrite)]" "provision: {gid: 2000, mode: \"2770\"}"
+check "team share Ready" wait_for 60 ready_is "$P-team" True/Resolved
+T0=$(date +%s)
+pvc "$NS_TEAM" work "$P-team-rw" ReadWriteOnce
+check "team claim Bound (RWO requested, as Helm charts do)" wait_for 300 phase_is "$NS_TEAM" work Bound
+echo "seconds from claim to Bound, including the preparer: $(( $(date +%s) - T0 ))"
+kubectl get fsd -o wide | grep -E "NAME|$NS_TEAM"
+check "the directory record is Prepared/DirectoryCreated" sh -c "kubectl get fsd -o jsonpath='{range .items[?(@.spec.namespace==\"$NS_TEAM\")]}{.status.conditions[0].reason}{end}' | grep -qx DirectoryCreated"
+check "the directory is root:2000 2770 on the file system" sh -c "[ \"\$(kubectl -n $NS_ADMIN exec root -- stat -c '%u:%g %a' /shared/$P/$NS_TEAM)\" = '0:2000 2770' ]"
+check "no temporary directory is left" sh -c "! kubectl -n $NS_ADMIN exec root -- ls -a /shared/$P | grep -q sharedfs-tmp"
+check "the preparer pod, claim and volume are gone" wait_for 60 sh -c "! kubectl -n $CTRL_NS get pod,pvc -o name | grep -q sfs-prep- && ! kubectl get pv -o name | grep -q sfs-prep-"
+pod "$NS_TEAM" w work 1000 2000
+check "team pod (uid 1000, group 2000) running" wait_for 180 running "$NS_TEAM" w
+check "team pod writes its directory" sh_in "$NS_TEAM" w "echo $NONCE > /shared/mine && [ \"\$(stat -c %g /shared/mine)\" = 2000 ]"
+check "team pod sees only its own directory" sh_in "$NS_TEAM" w "[ \"\$(ls -A /shared)\" = mine ]"
+WORK_PV=$(kubectl -n "$NS_TEAM" get pvc work -o jsonpath='{.spec.volumeName}')
+kubectl get pv "$WORK_PV" -o custom-columns=NAME:.metadata.name,MODES:.spec.accessModes,OPTS:.spec.mountOptions,SUB:.spec.csi.volumeAttributes.mountname,FIN:.metadata.finalizers
+
+step "2. a read-only share for another namespace"
+share "$P-data" "$P/data" "[$(sel reader ReadOnly), $(sel team ReadOnly)]"
+check "data share Ready" wait_for 60 ready_is "$P-data" True/Resolved
+pvc "$NS_READER" data "$P-data-ro" ReadOnlyMany
+check "reader claim Bound (ROX requested)" wait_for 60 phase_is "$NS_READER" data Bound
+pod "$NS_READER" r data 1000 1000
+check "reader pod running" wait_for 180 running "$NS_READER" r
+check "reader reads the admin's file" sh -c "[ \"\$(kubectl -n $NS_READER exec r -- cat /shared/nonce)\" = $NONCE ]"
+check "reader cannot write (read-only mount)" sh -c "kubectl -n $NS_READER exec r -- sh -c 'echo x > /shared/x' 2>&1 | grep -q 'Read-only file system'"
+check "reader sees only the data directory" sh_in "$NS_READER" r "[ \"\$(ls -A /shared)\" = nonce ]"
+sh_in "$NS_READER" r "grep ' /shared ' /proc/mounts"
+check "the read-only mount uses localflock" sh_in "$NS_READER" r "grep ' /shared ' /proc/mounts | grep -q localflock"
+
+step "3. claims that must not be provisioned"
+pvc "$NS_NONE" data "$P-data-ro"
+check "ungranted namespace: Pending with NotGranted" wait_for 60 event_seen "$NS_NONE" data NotGranted
+check "  and still Pending" phase_is "$NS_NONE" data Pending
+pvc "$NS_READER" rw "$P-data-rw"
+check "read-write class of a read-only grant: NotGranted" wait_for 60 event_seen "$NS_READER" rw NotGranted
+pvc "$NS_TEAM" rwop "$P-data-ro" ReadWriteOncePod
+check "ReadWriteOncePod: UnsupportedClaim" wait_for 60 event_seen "$NS_TEAM" rwop UnsupportedClaim
+check "expansion of a provisioned claim is refused" sh -c "! kubectl -n $NS_TEAM patch pvc work -p '{\"spec\":{\"resources\":{\"requests\":{\"storage\":\"2Gi\"}}}}' 2>/dev/null"
+
+step "4. a generic ephemeral volume (one PV per pod, created and deleted with it)"
 kubectl apply -f - >/dev/null <<EOF
 apiVersion: v1
-kind: PersistentVolumeClaim
-metadata: {name: steal, namespace: $NS_NONE}
-spec: {accessModes: [ReadWriteMany], storageClassName: "", volumeName: $RW_PV, resources: {requests: {storage: 1Gi}}}
+kind: Pod
+metadata: {name: eph, namespace: $NS_TEAM}
+spec:
+  nodeSelector: {kubernetes.io/hostname: $NODE}
+  terminationGracePeriodSeconds: 1
+  restartPolicy: Never
+  containers:
+  - {name: c, image: public.ecr.aws/docker/library/busybox:1.36, command: [sleep, "3600"], volumeMounts: [{name: d, mountPath: /shared}]}
+  volumes:
+  - name: d
+    ephemeral:
+      volumeClaimTemplate:
+        spec: {accessModes: [ReadOnlyMany], storageClassName: $P-data-ro, resources: {requests: {storage: 1Gi}}}
 EOF
-sleep 20
-check "a PVC naming the rw PV stays Pending" pvc_phase_is "$NS_NONE" steal Pending
+check "ephemeral pod running" wait_for 180 running "$NS_TEAM" eph
+check "it reads the data" sh -c "[ \"\$(kubectl -n $NS_TEAM exec eph -- cat /shared/nonce)\" = $NONCE ]"
+EPH_PV=$(kubectl -n "$NS_TEAM" get pvc eph-d -o jsonpath='{.spec.volumeName}')
+kubectl -n "$NS_TEAM" delete pod eph --wait=true >/dev/null
+check "its claim and volume go with the pod" wait_for 120 sh -c "! kubectl -n $NS_TEAM get pvc eph-d >/dev/null 2>&1 && ! kubectl get pv $EPH_PV >/dev/null 2>&1"
 
-step "3. deleting the PVC heals with no human step (Released trap)"
-kubectl -n "$NS_RW" delete pod w --wait=true >/dev/null
-OLD_UID=$(kubectl -n "$NS_RW" get pvc data -o jsonpath='{.metadata.uid}')
-# --wait=false: the controller recreates a PVC of the same name at once, which kubectl --wait
-# can keep waiting on.
-kubectl -n "$NS_RW" delete pvc data --wait=false >/dev/null
-check "a new PVC is created and Bound" wait_for 90 sh -c "pvc=\$(kubectl -n $NS_RW get pvc data -o jsonpath='{.metadata.uid}/{.status.phase}' 2>/dev/null); [ \"\${pvc%/*}\" != $OLD_UID ] && [ \"\${pvc#*/}\" = Bound ]"
-kubectl get events -n "$NS_RW" --field-selector reason=Rebinding -o custom-columns=REASON:.reason,MESSAGE:.message 2>/dev/null | tail -2
-pod "$NS_RW" w data
-check "the nonce is still there" wait_for 120 sh -c "[ \"\$(kubectl -n $NS_RW exec w -- cat $DIR/nonce 2>/dev/null)\" = $NONCE ]"
+step "5. a symlink as the share's directory is not followed"
+share "$P-link" "$P/link" "[$(sel admin ReadOnly)]"
+check "link share Ready (the controller cannot see the file system)" wait_for 60 ready_is "$P-link" True/Resolved
+pvc "$NS_ADMIN" link "$P-link-ro"
+check "its claim is Bound" wait_for 60 phase_is "$NS_ADMIN" link Bound
+pod "$NS_ADMIN" l link
+sleep 60
+check "but the pod never starts: Lustre refuses the symlink" not running "$NS_ADMIN" l
+kubectl -n "$NS_ADMIN" get events --field-selector involvedObject.name=l,reason=FailedMount -o custom-columns=MSG:.message 2>/dev/null | tail -1 | cut -c1-200
+kubectl -n "$NS_ADMIN" delete pod l --wait=false >/dev/null
 
-step "4. server-side apply does not churn the PV"
-RV1=$(kubectl get pv "$RW_PV" -o jsonpath='{.metadata.resourceVersion}')
-kubectl -n "$NS_RW" annotate sfc data sharedfs-e2e/poke="$(date +%s)" --overwrite >/dev/null; sleep 10
-check "PV resourceVersion unchanged after a reconcile" sh -c "[ \"\$(kubectl get pv $RW_PV -o jsonpath='{.metadata.resourceVersion}')\" = $RV1 ]"
+step "6. a new outer read-write share does not stop shares already in use"
+share "$P-outer" "$P" "[$(sel team ReadWrite)]"
+check "outer share not Ready: OverlappingShare" wait_for 60 ready_is "$P-outer" False/OverlappingShare
+check "the inner team share stays Ready" ready_is "$P-team" True/Resolved
+check "the inner data share stays Ready" ready_is "$P-data" True/Resolved
+kubectl get fss "$P-outer" -o jsonpath='{.status.conditions[0].message}'; echo
+pvc "$NS_TEAM" outer "$P-outer-rw"
+check "claims of the outer share are not provisioned" wait_for 60 event_seen "$NS_TEAM" outer ShareNotReady
 
-step "4b. deleting a granted claim in use waits for its pod, then PVC, PV and claim go in order"
-kubectl apply -f - >/dev/null <<EOF
-apiVersion: sharedfs.littlemex.github.io/v1alpha1
-kind: SharedFilesystemClaim
-metadata: {name: inuse, namespace: $NS_RW}
-spec: {filesystemRef: {name: $P}}
-EOF
-check "inuse claim Ready" wait_for 90 cond_is "$NS_RW" inuse Ready True/Ready
-INUSE_PV=$(kubectl -n "$NS_RW" get sfc inuse -o jsonpath='{.status.persistentVolumeName}')
-pod "$NS_RW" u inuse
-check "its pod is running" wait_for 120 running "$NS_RW" u
-kubectl -n "$NS_RW" delete sfc inuse --wait=false >/dev/null
-check "claim waits (Deleting) while the pod runs" wait_for 30 cond_is "$NS_RW" inuse Ready False/Deleting
-sleep 10
-check "the PV is not deleted while the PVC is in use" sh -c "[ -z \"\$(kubectl get pv $INUSE_PV -o jsonpath='{.metadata.deletionTimestamp}')\" ]"
-kubectl -n "$NS_RW" delete pod u --wait=true >/dev/null
-check "claim, PVC and PV are gone once the pod stops" wait_for 90 sh -c "! kubectl -n $NS_RW get sfc inuse >/dev/null 2>&1 && ! kubectl -n $NS_RW get pvc inuse >/dev/null 2>&1 && ! kubectl get pv $INUSE_PV >/dev/null 2>&1"
-
-step "5. revoking a namespace: grace period, running pod keeps its mount, new pods do not start"
-kubectl label ns "$NS_RO" "$KEY-" >/dev/null
-check "claim reports NamespaceNotGranted" wait_for 30 cond_is "$NS_RO" data Accepted False/NamespaceNotGranted
+step "7. revoking a namespace: grace period, running pods keep their mount"
+kubectl label ns "$NS_READER" "$KEY-" >/dev/null
+DATA_PV=$(kubectl -n "$NS_READER" get pvc data -o jsonpath='{.spec.volumeName}')
+check "the deadline is recorded on the PV" wait_for 30 sh -c "kubectl get pv $DATA_PV -o jsonpath='{.metadata.annotations}' | grep -q withdraw-after"
 sleep $((GRACE/2))
-check "PVC not deleted during the grace period" sh -c "[ -z \"\$(kubectl -n $NS_RO get pvc data -o jsonpath='{.metadata.deletionTimestamp}')\" ]"
-check "PVC Terminating after the grace period" wait_for $((GRACE+30)) sh -c "[ -n \"\$(kubectl -n $NS_RO get pvc data -o jsonpath='{.metadata.deletionTimestamp}')\" ]"
-check "claim Ready reason is Revoking" cond_is "$NS_RO" data Ready False/Revoking
-check "the running pod still reads" sh -c "[ \"\$(kubectl -n $NS_RO exec r -- cat $DIR/nonce)\" = $NONCE ]"
-pod "$NS_RO" r2 data; sleep 20
-check "a new pod does not start" sh -c "! kubectl -n $NS_RO get pod r2 -o jsonpath='{.status.phase}' | grep -q Running"
-kubectl -n "$NS_RO" get events --field-selector involvedObject.name=r2 -o custom-columns=REASON:.reason,MSG:.message 2>/dev/null | tail -2
-kubectl -n "$NS_RO" delete pod r r2 --wait=true >/dev/null
-check "PVC and PV are gone once the pods stop" wait_for 90 sh -c "! kubectl -n $NS_RO get pvc data >/dev/null 2>&1 && [ -z \"\$(kubectl -n $NS_RO get sfc data -o jsonpath='{.status.persistentVolumeName}')\" ]"
+check "PVC not deleted during the grace period" sh -c "[ -z \"\$(kubectl -n $NS_READER get pvc data -o jsonpath='{.metadata.deletionTimestamp}')\" ]"
+check "PVC Terminating after the grace period" wait_for $((GRACE+30)) sh -c "[ -n \"\$(kubectl -n $NS_READER get pvc data -o jsonpath='{.metadata.deletionTimestamp}')\" ]"
+check "the running pod still reads" sh -c "[ \"\$(kubectl -n $NS_READER exec r -- cat /shared/nonce)\" = $NONCE ]"
+kubectl -n "$NS_READER" delete pod r --wait=true >/dev/null
+check "PVC and PV are gone once the pod stops (Released, then deleted by sharedfs)" wait_for 120 sh -c "! kubectl -n $NS_READER get pvc data >/dev/null 2>&1 && ! kubectl get pv $DATA_PV >/dev/null 2>&1"
 
-step "5b. a claim removed while the controller is down leaves nothing behind"
-kubectl apply -f - >/dev/null <<EOF
-apiVersion: sharedfs.littlemex.github.io/v1alpha1
-kind: SharedFilesystemClaim
-metadata: {name: stray, namespace: $NS_RW}
-spec: {filesystemRef: {name: $P}}
-EOF
-check "stray claim Ready" wait_for 90 cond_is "$NS_RW" stray Ready True/Ready
-STRAY_PV=$(kubectl -n "$NS_RW" get sfc stray -o jsonpath='{.status.persistentVolumeName}')
-# With the controller stopped, the claim's own finalizer cannot run: only the orphan sweep at
-# startup can remove what is left.
-kubectl -n "$CTRL_NS" scale deploy "$CTRL_DEPLOY" --replicas=0 >/dev/null
-kubectl -n "$CTRL_NS" wait --for=delete pod -l control-plane=controller-manager --timeout=120s >/dev/null 2>&1
-kubectl -n "$NS_RW" delete sfc stray --wait=false >/dev/null
-kubectl -n "$NS_RW" patch sfc stray --type=merge -p '{"metadata":{"finalizers":null}}' >/dev/null
-# The PVC may already be gone: the garbage collector follows its ownerReference to the claim.
-# The PV is cluster-scoped and has no owner, so only sharedfs can remove it.
-check "the claim is gone and its PV is still there" sh -c "! kubectl -n $NS_RW get sfc stray >/dev/null 2>&1 && kubectl get pv $STRAY_PV >/dev/null 2>&1"
-echo "PVC while the controller is down: $(kubectl -n "$NS_RW" get pvc stray -o jsonpath='{.metadata.name}' 2>/dev/null || true)(empty = removed by the garbage collector)"
-kubectl -n "$CTRL_NS" scale deploy "$CTRL_DEPLOY" --replicas=1 >/dev/null
-check "after restart, the PV (and PVC, if left) is swept" wait_for 120 sh -c "! kubectl -n $NS_RW get pvc stray >/dev/null 2>&1 && ! kubectl get pv $STRAY_PV >/dev/null 2>&1"
+step "8. a namespace deleted and created again does not inherit the directory"
+kubectl -n "$NS_TEAM" delete pod w --wait=true >/dev/null
+kubectl delete ns "$NS_TEAM" --wait=true --timeout=180s >/dev/null
+kubectl create ns "$NS_TEAM" >/dev/null; kubectl label ns "$NS_TEAM" "$KEY=team" >/dev/null
+pvc "$NS_TEAM" work "$P-team-rw"
+check "the new namespace's claim: NamespaceRecreated" wait_for 60 event_seen "$NS_TEAM" work NamespaceRecreated
+check "  and Pending" phase_is "$NS_TEAM" work Pending
+check "the earlier team's file is still there, untouched" sh -c "[ \"\$(kubectl -n $NS_ADMIN exec root -- cat /shared/$P/$NS_TEAM/mine)\" = $NONCE ]"
+kubectl delete fsd "$(kubectl get fsd -o jsonpath="{.items[?(@.spec.namespace==\"$NS_TEAM\")].metadata.name}")" >/dev/null
+check "after an admin deletes the record, the claim is Bound (the directory already exists)" wait_for 120 phase_is "$NS_TEAM" work Bound
+check "  and the record says DirectoryExists" wait_for 30 sh -c "kubectl get fsd -o jsonpath='{range .items[?(@.spec.namespace==\"$NS_TEAM\")]}{.status.conditions[0].reason}{end}' | grep -qx DirectoryExists"
 
-step "6. the SharedFilesystem waits for its volumes"
-kubectl delete sfs "$P" --wait=false >/dev/null
-check "SharedFilesystem reports VolumesRemaining" wait_for 30 sh -c "kubectl get sfs $P -o jsonpath='{.status.conditions[0].reason}' | grep -q VolumesRemaining"
-check "the rw claim reports FilesystemDeleting" wait_for 30 cond_is "$NS_RW" data Accepted False/FilesystemDeleting
-sleep $((GRACE+5))
-check "and keeps its PVC past the grace period" sh -c "[ -z \"\$(kubectl -n $NS_RW get pvc data -o jsonpath='{.metadata.deletionTimestamp}')\" ]"
-
-step "6b. removing the grants of a SharedFilesystem being deleted still withdraws access"
-kubectl patch sfs "$P" --type=merge -p '{"spec":{"grants":null}}' >/dev/null
-check "claim reports NamespaceNotGranted" wait_for 30 cond_is "$NS_RW" data Accepted False/NamespaceNotGranted
-check "PVC Terminating after the grace period" wait_for $((GRACE+30)) sh -c "[ -n \"\$(kubectl -n $NS_RW get pvc data -o jsonpath='{.metadata.deletionTimestamp}')\" ]"
-check "claim names the pod that still mounts it" wait_for 30 sh -c "kubectl -n $NS_RW get sfc data -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].message}' | grep -q 'still mounted by w'"
-
-step "7. once the pod stops, everything goes and the source stays"
-kubectl -n "$NS_RW" exec w -- rm -rf "$DIR" >/dev/null 2>&1
-kubectl -n "$NS_RW" delete pod w --wait=true >/dev/null
-check "PVC and PV are gone" wait_for 90 sh -c "! kubectl -n $NS_RW get pvc data >/dev/null 2>&1 && ! kubectl get pv $RW_PV >/dev/null 2>&1"
-kubectl -n "$NS_RW" delete sfc data --wait=false >/dev/null
-check "the claim goes" wait_for 60 sh -c "! kubectl -n $NS_RW get sfc data >/dev/null 2>&1"
-check "the SharedFilesystem lets go by itself" wait_for 60 gone sfs "$P"
-check "the source PV is untouched" sh -c "kubectl get pv $SRC >/dev/null"
+step "9. a share waits for its volumes, and the source is never touched"
+kubectl delete fss "$P-team" --wait=false >/dev/null
+check "team share reports VolumesRemaining" wait_for 30 sh -c "kubectl get fss $P-team -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].reason}' | grep -qx VolumesRemaining"
+kubectl get fss "$P-team" -o jsonpath='{.metadata.deletionTimestamp} volumes={.status.volumes} {.status.conditions[0].reason}: {.status.conditions[0].message}{"\n"}' 2>&1
+kubectl -n "$NS_TEAM" delete pvc work --wait=false >/dev/null
+check "then lets go once its claims are gone" wait_for 120 gone fss "$P-team"
+check "the source PV is unchanged" sh -c "[ \"\$(kubectl get pv $SRC -o jsonpath='{.metadata.resourceVersion}')\" = $SRC_RV ]"
+check "the controller logged no reconciler errors" sh -c "! kubectl -n $CTRL_NS logs deploy/sharedfs-controller-manager --since=1h | grep -q 'Reconciler error'"
