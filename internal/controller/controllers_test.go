@@ -308,6 +308,25 @@ var _ = Describe("FilesystemShare", func() {
 		Eventually(readyOf(s), timeout, interval).Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonSourceUnreserved))
 	})
 
+	It("is not Ready when its source is pointed at another file system while volumes remain", func() {
+		src := sourcePV(uniq("src"))
+		s := share(uniq("ds"), src.Name, "datasets", grant("sw", sharedfsv1alpha1.AccessReadOnly))
+		ns := namespace("sw")
+		create(src, s, ns)
+		readyShare(s)
+		pvc := claim(ns.Name, s.Name+"-ro")
+		create(pvc)
+		provisioned(pvc)
+		Eventually(func() int32 { _ = k8sClient.Get(ctx, client.ObjectKeyFromObject(s), s); return s.Status.Volumes }, timeout, interval).Should(Equal(int32(1)))
+		By("the admin recreates the source volume under the same name for another file system")
+		Expect(k8sClient.Delete(ctx, src)).To(Succeed())
+		gone(src)
+		other := sourcePV(src.Name)
+		other.Spec.CSI.VolumeAttributes["dnsname"] = "other.fsx.example"
+		create(other)
+		Eventually(readyOf(s), timeout, interval).Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonSourceChanged))
+	})
+
 	It("is not Ready on an unreserved source", func() {
 		src := sourcePV(uniq("src"))
 		src.Spec.ClaimRef = nil

@@ -36,6 +36,7 @@ const (
 	ReasonSourceIsGenerated  = "SourceIsGenerated"
 	ReasonInvalidSource      = "InvalidSource"
 	ReasonSourceUnreserved   = "SourceUnreserved"
+	ReasonSourceChanged      = "SourceChanged"
 	ReasonInvalidPath        = "InvalidPath"
 	ReasonSubPathUnsupported = "SubPathUnsupported"
 	ReasonInvalidGrant       = "InvalidGrant"

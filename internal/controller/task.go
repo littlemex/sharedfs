@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"slices"
 	"time"
 
@@ -27,7 +28,9 @@ const (
 	// taskTimeout is when a pod that has not finished is given up on, which also covers a pod
 	// that is never scheduled, where activeDeadlineSeconds does not run.
 	taskTimeout = taskDeadline + time.Minute
-	maxBackoff  = time.Hour
+	// unscheduledTimeout is how long a pod may wait for a node.
+	unscheduledTimeout = 15 * time.Minute
+	maxBackoff         = time.Hour
 )
 
 // task is one kind of short-lived pod a directory record needs: the preparer, which creates the
@@ -109,8 +112,14 @@ func (t *task) run(ctx context.Context, dir *sharedfsv1alpha1.FilesystemShareDir
 	}
 	report, raw, finished := t.report(&pod)
 	if !finished {
-		if age := time.Since(pod.CreationTimestamp.Time); age < taskTimeout {
-			return ctrl.Result{RequeueAfter: taskTimeout - age}, taskIdle, nil
+		// Counted from when the kubelet took the pod, as activeDeadlineSeconds is, so a node that
+		// Karpenter is still starting does not count; a pod never scheduled gets longer.
+		since, limit := pod.CreationTimestamp.Time, unscheduledTimeout
+		if pod.Status.StartTime != nil {
+			since, limit = pod.Status.StartTime.Time, taskTimeout
+		}
+		if age := time.Since(since); age < limit {
+			return ctrl.Result{RequeueAfter: limit - age}, taskIdle, nil
 		}
 		report = taskReport{Outcome: sharedfsv1alpha1.ReasonPreparerTimedOut, Message: t.stuck(&pod)}
 	}
@@ -155,8 +164,13 @@ func (t *task) report(pod *corev1.Pod) (taskReport, string, bool) {
 	if pod.Status.Reason == "DeadlineExceeded" {
 		return taskReport{Outcome: sharedfsv1alpha1.ReasonPreparerTimedOut, Message: t.stuck(pod)}, "", true
 	}
-	return taskReport{Outcome: t.failed, Message: fmt.Sprintf(
-		"the %s pod ended without a result: %s %s", t.what, pod.Status.Reason, pod.Status.Message)}, "", true
+	why := pod.Status.Reason + " " + pod.Status.Message
+	for _, s := range pod.Status.ContainerStatuses {
+		if term := s.State.Terminated; term != nil {
+			why += fmt.Sprintf(" container %s: %s, exit code %d", s.Name, term.Reason, term.ExitCode)
+		}
+	}
+	return taskReport{Outcome: t.failed, Message: fmt.Sprintf("the %s pod ended without a result:%s", t.what, why)}, "", true
 }
 
 // stuck says where a pod that never reported got stuck.
@@ -216,7 +230,16 @@ func (t *task) start(ctx context.Context, dir *sharedfsv1alpha1.FilesystemShareD
 	if err := controllerutil.SetControllerReference(dir, pv, t.Scheme()); err != nil {
 		return false, err
 	}
-	if err := t.Create(ctx, pv); client.IgnoreAlreadyExists(err) != nil {
+	if err := t.Create(ctx, pv); apierrors.IsAlreadyExists(err) {
+		// Left by a run whose cleanup stopped half-way: it is reserved for an older claim.
+		var old corev1.PersistentVolume
+		if err := t.Get(ctx, client.ObjectKeyFromObject(pv), &old); err != nil {
+			return false, client.IgnoreNotFound(err)
+		}
+		if old.Spec.ClaimRef == nil || old.Spec.ClaimRef.UID != pvc.UID {
+			return true, client.IgnoreNotFound(t.Delete(ctx, &old))
+		}
+	} else if err != nil {
 		return false, err
 	}
 	pod.Name, pod.Namespace = t.name, t.namespace
@@ -307,7 +330,7 @@ func taskPod(cfg PreparerConfig, image string, caps []corev1.Capability, mountPa
 			ServiceAccountName:            cfg.ServiceAccount,
 			AutomountServiceAccountToken:  new(bool),
 			EnableServiceLinks:            new(bool),
-			NodeSelector:                  cfg.NodeSelector,
+			NodeSelector:                  withArch(cfg.NodeSelector),
 			Tolerations:                   cfg.Tolerations,
 			ImagePullSecrets:              cfg.ImagePullSecrets,
 			TerminationGracePeriodSeconds: new(int64),
@@ -335,3 +358,16 @@ func taskPod(cfg PreparerConfig, image string, caps []corev1.Capability, mountPa
 }
 
 func boolPtr(v bool) *bool { return &v }
+
+// withArch adds the controller's own CPU architecture to a node selector that names none: task
+// pods run the controller's image, built for one architecture.
+func withArch(sel map[string]string) map[string]string {
+	if _, ok := sel[corev1.LabelArchStable]; ok {
+		return sel
+	}
+	out := map[string]string{corev1.LabelArchStable: runtime.GOARCH}
+	for k, v := range sel {
+		out[k] = v
+	}
+	return out
+}

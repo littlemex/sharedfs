@@ -122,6 +122,20 @@ func (r *ShareReconciler) check(ctx context.Context, share *sharedfsv1alpha1.Fil
 		}
 		return "", "", err
 	}
+	if prev := share.Status.Resolved; prev != nil && share.Status.Volumes > 0 {
+		// Volumes made from the old source keep mounting it; new ones would mount another file
+		// system under the same share and directory records.
+		old := &volume.Source{VolumeAttributes: prev.VolumeAttributes}
+		if p, ok := driver.Lookup(prev.Driver); ok {
+			old.Profile = p
+		}
+		ofs, obase := old.Identity()
+		nfs, nbase := src.Identity()
+		if ofs != nfs || obase != nbase {
+			return sharedfsv1alpha1.ReasonSourceChanged, fmt.Sprintf(
+				"PersistentVolume %s now points at another file system than the %d volume(s) of this share; restore it, or create a new share", pv.Name, share.Status.Volumes), nil
+		}
+	}
 	share.Status.Resolved = src.Status()
 	if !path.IsRoot() && src.Profile.SubPath == nil {
 		return sharedfsv1alpha1.ReasonSubPathUnsupported,
@@ -194,8 +208,7 @@ func (r *ShareReconciler) checkDriver(ctx context.Context, name string) (string,
 // checkOverlap compares the share with every other share on the same file system. When one
 // share's directory may lie strictly inside the other's and the outer share grants ReadWrite, a
 // writer of the outer path can rename or plant files in what the inner one exposes. One share of
-// such a pair is not Ready: a share with provisioned volumes before one without, so a share in
-// use is never stopped by another one, then the newer, then the greater UID. A read-only outer
+// such a pair is not Ready: the one that brought the conflict later (see gives). A read-only outer
 // share, and two shares that may name the same directory, only warn. A share being deleted counts
 // while it still has volumes.
 func (r *ShareReconciler) checkOverlap(ctx context.Context, share *sharedfsv1alpha1.FilesystemShare, src *volume.Source) (string, string, error) {

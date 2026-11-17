@@ -108,9 +108,14 @@ func (r *ProvisionerReconciler) provision(ctx context.Context, pvc *corev1.Persi
 		}
 		return r.pending(pvc, sharedfsv1alpha1.EventShareNotReady, fmt.Sprintf("FilesystemShare %s is not Ready: %s", share.Name, msg))
 	}
+	// Live: the namespace's UID decides whether a recreated namespace inherits a directory, and a
+	// cache that lags a delete and re-create would get that wrong.
 	var ns corev1.Namespace
-	if err := r.Get(ctx, types.NamespacedName{Name: pvc.Namespace}, &ns); err != nil {
-		return ctrl.Result{}, err
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: pvc.Namespace}, &ns); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if !ns.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
 	}
 	if ok, err := grantFor(share, &ns, access); err != nil || !ok {
 		return r.pending(pvc, sharedfsv1alpha1.EventNotGranted, fmt.Sprintf(
