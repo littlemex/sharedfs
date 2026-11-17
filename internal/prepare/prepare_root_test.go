@@ -3,7 +3,6 @@ package prepare
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -59,17 +58,31 @@ func TestSetgidParentDoesNotLeakIntoMode(t *testing.T) {
 
 func TestLeftoversRemoved(t *testing.T) {
 	d := rootParent(t, 0o755)
-	if err := os.Mkdir(filepath.Join(d, TempPrefix+"dead"), 0o700); err != nil {
+	if err := os.Mkdir(filepath.Join(d, tempName("x")), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(d, tempName("y"))
+	if err := os.Mkdir(other, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if r := Run(Request{Root: d, Name: "x", GID: 7, Mode: "0750"}); r.Outcome != Created {
 		t.Fatalf("%+v", r)
 	}
-	entries, _ := os.ReadDir(d)
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), TempPrefix) {
-			t.Fatalf("leftover %s", e.Name())
-		}
+	if _, err := os.Stat(filepath.Join(d, tempName("x"))); !os.IsNotExist(err) {
+		t.Fatal("the interrupted run's temporary directory must be removed")
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Fatal("another name's temporary directory is not ours to remove")
+	}
+}
+
+func TestSetgidParentOfAnotherGroup(t *testing.T) {
+	d := rootParent(t, 0o755|os.ModeSetgid)
+	if err := os.Chown(d, 0, 7); err != nil {
+		t.Fatal(err)
+	}
+	if r := Run(Request{Root: d, Name: "x", GID: 1000, Mode: "2770"}); r.Outcome != Created || r.Mode != "2770" || r.GID != 1000 {
+		t.Fatalf("%+v", r)
 	}
 }
 

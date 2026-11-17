@@ -240,6 +240,12 @@ var _ = Describe("FilesystemShare API", func() {
 		}
 	})
 
+	It("refuses provision on the root", func() {
+		s := share(uniq("root"), "none", "/", grant("x", sharedfsv1alpha1.AccessReadOnly))
+		s.Spec.Provision = &sharedfsv1alpha1.Provision{GID: 1, Mode: "2770"}
+		Expect(apierrors.IsInvalid(k8sClient.Create(ctx, s))).To(BeTrue())
+	})
+
 	It("keeps everything but the grants immutable and refuses empty selectors", func() {
 		s := share(uniq("imm"), "none", "datasets", grant("x", sharedfsv1alpha1.AccessReadOnly))
 		create(s)
@@ -323,7 +329,7 @@ var _ = Describe("FilesystemShare", func() {
 
 		By("an inner share already in use is not stopped by an outer share that gains ReadWrite later")
 		src2 := sourcePV(uniq("src"))
-		outer2 := share(uniq("outer"), src2.Name, "teams", grant("a", sharedfsv1alpha1.AccessReadOnly))
+		outer2 := share(uniq("outer"), src2.Name, "teams", grant("in2", sharedfsv1alpha1.AccessReadOnly))
 		inner2 := share(uniq("inner"), src2.Name, "teams/x", grant("in2", sharedfsv1alpha1.AccessReadWrite))
 		ns2 := namespace("in2")
 		create(src2, outer2, inner2, ns2)
@@ -334,8 +340,16 @@ var _ = Describe("FilesystemShare", func() {
 			_ = k8sClient.Get(ctx, client.ObjectKeyFromObject(inner2), inner2)
 			return inner2.Status.Volumes
 		}, timeout, interval).Should(BeNumerically(">", 0))
+		By("even when the outer share is in use too")
+		create(claim(ns2.Name, outer2.Name+"-ro"))
+		Eventually(func() int32 {
+			_ = k8sClient.Get(ctx, client.ObjectKeyFromObject(outer2), outer2)
+			return outer2.Status.Volumes
+		}, timeout, interval).Should(BeNumerically(">", 0))
+		// The grant arrives in a later second than the inner share's creation.
+		time.Sleep(1100 * time.Millisecond)
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(outer2), outer2)).To(Succeed())
-		outer2.Spec.Grants = []sharedfsv1alpha1.Grant{grant("a", sharedfsv1alpha1.AccessReadWrite)}
+		outer2.Spec.Grants = []sharedfsv1alpha1.Grant{grant("in2", sharedfsv1alpha1.AccessReadWrite)}
 		Expect(k8sClient.Update(ctx, outer2)).To(Succeed())
 		Eventually(readyOf(outer2), timeout, interval).Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonOverlappingShare))
 		Consistently(readyOf(inner2), 2*time.Second, interval).Should(haveCondition(metav1.ConditionTrue, sharedfsv1alpha1.ReasonResolved))
@@ -601,6 +615,11 @@ var _ = Describe("Directories", func() {
 			return meta.FindStatusCondition(dir.Status.Conditions, sharedfsv1alpha1.ConditionPrepared)
 		}, timeout, interval).Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonInsecureParent))
 		Expect(dir.Status.Failures).To(Equal(int32(1)))
+		Expect(dir.Status.LastPreparer).To(Equal(pod.UID))
+		Consistently(func() int32 {
+			_ = k8sClient.Get(ctx, client.ObjectKeyFromObject(dir), dir)
+			return dir.Status.Failures
+		}, 3*time.Second, interval).Should(Equal(int32(1)), "one pod is counted once")
 		neverProvisioned(pvc)
 		Eventually(eventReasons(pvc), timeout, interval).Should(ContainElement(sharedfsv1alpha1.EventDirectoryNotReady))
 	})

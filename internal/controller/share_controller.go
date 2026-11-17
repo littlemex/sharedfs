@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -23,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	sharedfsv1alpha1 "github.com/littlemex/sharedfs/api/v1alpha1"
+	"github.com/littlemex/sharedfs/internal/driver"
 	"github.com/littlemex/sharedfs/internal/sharepath"
 	"github.com/littlemex/sharedfs/internal/volume"
 )
@@ -35,7 +37,7 @@ type ShareReconciler struct {
 	APIReader client.Reader
 }
 
-// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemshares,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemshares,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemshares/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemshares/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch
@@ -67,6 +69,12 @@ func (r *ShareReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 	share.Status.Volumes = int32(len(volumes))
+	switch rw := grantsReadWrite(&share); {
+	case rw && share.Status.ReadWriteSince == nil:
+		share.Status.ReadWriteSince = &metav1.Time{Time: time.Now().Truncate(time.Second)}
+	case !rw:
+		share.Status.ReadWriteSince = nil
+	}
 
 	reason, msg, err := r.check(ctx, &share)
 	if err != nil {
@@ -76,7 +84,7 @@ func (r *ShareReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	// why (ShareNotReady) instead of waiting on a StorageClass that does not exist.
 	if taken, err := r.ensureClasses(ctx, &share); err != nil {
 		return ctrl.Result{}, err
-	} else if taken != "" {
+	} else if taken != "" && reason == sharedfsv1alpha1.ReasonResolved {
 		reason, msg = sharedfsv1alpha1.ReasonStorageClassTaken,
 			fmt.Sprintf("StorageClass %s exists and is not this share's; rename the share or remove that class", taken)
 	}
@@ -231,7 +239,7 @@ func (r *ShareReconciler) checkOverlap(ctx context.Context, share *sharedfsv1alp
 				outer.Name, outer.Spec.Path, inner.Name, inner.Spec.Path))
 			continue
 		}
-		if gives(share, other) {
+		if gives(share, outer, inner) {
 			return fmt.Sprintf("share %s (path %s) grants ReadWrite on a directory that may contain share %s (path %s): "+
 				"a writer of the outer path can replace the inner directory. Annotate %s with %s=true if that is intended",
 				outer.Name, outer.Spec.Path, inner.Name, inner.Spec.Path, outer.Name, sharedfsv1alpha1.AnnotationAllowOverlap), "", nil
@@ -243,26 +251,52 @@ func (r *ShareReconciler) checkOverlap(ctx context.Context, share *sharedfsv1alp
 // sourceOf resolves another share's source, or nil if it has none that resolves.
 func (r *ShareReconciler) sourceOf(ctx context.Context, share *sharedfsv1alpha1.FilesystemShare) (*volume.Source, error) {
 	var pv corev1.PersistentVolume
-	if err := r.Get(ctx, types.NamespacedName{Name: share.Spec.PersistentVolumeRef.Name}, &pv); err != nil {
-		return nil, client.IgnoreNotFound(err)
+	err := r.Get(ctx, types.NamespacedName{Name: share.Spec.PersistentVolumeRef.Name}, &pv)
+	if client.IgnoreNotFound(err) != nil {
+		return nil, err
 	}
-	src, err := volume.Resolve(&pv)
-	if err != nil {
-		return nil, nil
+	if err == nil {
+		if src, err := volume.Resolve(&pv); err == nil {
+			return src, nil
+		}
 	}
-	return src, nil
+	// The source is gone or changed, but volumes made from it may remain: compare what they mount.
+	if res := share.Status.Resolved; res != nil && share.Status.Volumes > 0 {
+		if p, ok := driver.Lookup(res.Driver); ok {
+			return &volume.Source{Profile: p, VolumeAttributes: res.VolumeAttributes}, nil
+		}
+	}
+	return nil, nil
 }
 
-// gives reports whether a gives way to b in a conflicting pair. Both shares reach the same
-// verdict, and it does not depend on what either was judged before.
-func gives(a, b *sharedfsv1alpha1.FilesystemShare) bool {
-	if ua, ub := a.Status.Volumes > 0, b.Status.Volumes > 0; ua != ub {
-		return ub
+// gives reports whether a gives way to b in a conflicting pair where outer may contain inner.
+// The share that brought the conflict later gives way: the outer one by the time it first
+// granted ReadWrite (not yet recorded counts as later than anything), the inner one by its creation; then the
+// greater UID. A share in use therefore keeps its place against a ReadWrite grant added later to
+// an outer share, and both shares reach the same verdict.
+func gives(a, outer, inner *sharedfsv1alpha1.FilesystemShare) bool {
+	since := func(s *sharedfsv1alpha1.FilesystemShare) time.Time {
+		if s == outer {
+			if s.Status.ReadWriteSince == nil {
+				return time.Now().Add(time.Hour)
+			}
+			return s.Status.ReadWriteSince.Time
+		}
+		return s.CreationTimestamp.Time
 	}
-	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
-		return b.CreationTimestamp.Before(&a.CreationTimestamp)
+	to, ti := since(outer), since(inner)
+	var later *sharedfsv1alpha1.FilesystemShare
+	switch {
+	case to.After(ti):
+		later = outer
+	case ti.After(to):
+		later = inner
+	case outer.UID > inner.UID:
+		later = outer
+	default:
+		later = inner
 	}
-	return a.UID > b.UID
+	return later == a
 }
 
 // fullPath is a share's path from the file system root: the source's own sub-path base (for
@@ -281,7 +315,7 @@ func isReady(s *sharedfsv1alpha1.FilesystemShare) bool {
 // ensureClasses creates the share's two StorageClasses. Expansion is disallowed: the API server
 // then refuses to resize a claim, so a resize never reaches the driver with a handle that is not
 // a file system. It returns the name of a class that exists but is not the share's.
-func (r *ShareReconciler) ensureClasses(ctx context.Context, share *sharedfsv1alpha1.FilesystemShare) (string, error) {
+func (r *ShareReconciler) ensureClasses(ctx context.Context, share *sharedfsv1alpha1.FilesystemShare) (taken string, err error) {
 	names := ClassNames(share)
 	share.Status.StorageClasses = &names
 	for _, c := range []struct {
@@ -289,10 +323,10 @@ func (r *ShareReconciler) ensureClasses(ctx context.Context, share *sharedfsv1al
 		access sharedfsv1alpha1.Access
 	}{{names.ReadWrite, sharedfsv1alpha1.AccessReadWrite}, {names.ReadOnly, sharedfsv1alpha1.AccessReadOnly}} {
 		var existing storagev1.StorageClass
-		err := r.Get(ctx, types.NamespacedName{Name: c.name}, &existing)
+		err = r.Get(ctx, types.NamespacedName{Name: c.name}, &existing)
 		if err == nil {
-			if !metav1.IsControlledBy(&existing, share) {
-				return c.name, nil
+			if !metav1.IsControlledBy(&existing, share) && taken == "" {
+				taken = c.name
 			}
 			continue
 		}
@@ -323,7 +357,7 @@ func (r *ShareReconciler) ensureClasses(ctx context.Context, share *sharedfsv1al
 			return "", err
 		}
 	}
-	return "", nil
+	return taken, nil
 }
 
 // finalize keeps the share while any volume provisioned from it remains (read live: a volume

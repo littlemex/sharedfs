@@ -174,9 +174,15 @@ spec:
                   from 30s, doubling, to one hour.
                 format: int32
                 type: integer
-              lastAttemptTime:
-                description: lastAttemptTime is when the latest preparer pod was started.
+              lastFailureTime:
+                description: lastFailureTime is when the latest failure was recorded;
+                  the next attempt waits from it.
                 format: date-time
+                type: string
+              lastPreparer:
+                description: |-
+                  lastPreparer is the UID of the latest preparer pod whose outcome was recorded, so one
+                  pod is never counted twice.
                 type: string
               observed:
                 description: ObservedDirectory is what the preparer found or created.

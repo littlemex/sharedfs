@@ -79,7 +79,7 @@ func ownImage(pod *corev1.Pod) string {
 }
 
 // preparerConfig resolves where preparer pods run. The image defaults to the controller's own,
-// read from its pod, so the two can never drift apart.
+// read from its pod, and pinned to the digest when the pod's status already reports one.
 func preparerConfig(ctx context.Context, c client.Reader, image, sa, nodeSelector, tolerations string) (controller.PreparerConfig, error) {
 	cfg := controller.PreparerConfig{
 		Namespace:      os.Getenv("POD_NAMESPACE"),

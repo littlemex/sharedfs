@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -49,7 +50,9 @@ type DirectoryReconciler struct {
 	Preparer PreparerConfig
 }
 
-// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemsharedirectories,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemsharedirectories,verbs=get;list;watch
+// Owner references with blockOwnerDeletion need update on the owner's finalizers.
+// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemsharedirectories/finalizers,verbs=update
 // +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemsharedirectories/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;create;delete
 // Pods and internal claims are created only in the controller's namespace.
@@ -88,17 +91,20 @@ func (r *DirectoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			if err == nil {
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
-			if apierrors.IsInvalid(err) || apierrors.IsForbidden(err) {
-				// Refused by admission (Pod Security, a policy engine, a quota): say so and retry later.
+			if refused(err) {
+				// Refused by admission (Pod Security, a policy engine, a quota): say so, remove the
+				// internal claim and volume, which mount the parent read-write, and retry later.
 				dir.Status.Failures++
-				dir.Status.LastAttemptTime = &metav1.Time{Time: time.Now()}
+				dir.Status.LastFailureTime = &metav1.Time{Time: time.Now()}
 				setCondition(&dir.Status.Conditions, dir.Generation, sharedfsv1alpha1.ConditionPrepared, false,
 					sharedfsv1alpha1.ReasonPreparerNotCreated, truncate(err.Error()))
-				return ctrl.Result{RequeueAfter: backoff(&dir)}, r.updateStatus(ctx, &dir, before)
+				if err := r.updateStatus(ctx, &dir, before); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{RequeueAfter: backoff(&dir)}, r.cleanup(ctx, &dir)
 			}
 			return ctrl.Result{}, err
 		}
-		dir.Status.LastAttemptTime = &metav1.Time{Time: time.Now()}
 		setCondition(&dir.Status.Conditions, dir.Generation, sharedfsv1alpha1.ConditionPrepared, false,
 			sharedfsv1alpha1.ReasonPreparing, fmt.Sprintf("preparer pod %s/%s started", r.Preparer.Namespace, volume.PreparerName(dir.UID)))
 		return ctrl.Result{RequeueAfter: preparerTimeout}, r.updateStatus(ctx, &dir, before)
@@ -110,9 +116,9 @@ func (r *DirectoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		// Not ours: never take a result from a pod someone else created under this name.
 		return ctrl.Result{RequeueAfter: time.Minute}, fmt.Errorf("pod %s/%s is not controlled by %s", pod.Namespace, pod.Name, dir.Name)
 	}
-	if !pod.DeletionTimestamp.IsZero() {
-		// A finished pod is being removed; its result is already recorded.
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	if !pod.DeletionTimestamp.IsZero() || pod.UID == dir.Status.LastPreparer {
+		// A finished pod whose outcome is recorded, on its way out.
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, r.cleanup(ctx, &dir)
 	}
 	res, done := result(&pod)
 	if !done {
@@ -131,7 +137,9 @@ func (r *DirectoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	} else {
 		dir.Status.Failures++
+		dir.Status.LastFailureTime = &metav1.Time{Time: time.Now()}
 	}
+	dir.Status.LastPreparer = pod.UID
 	setCondition(&dir.Status.Conditions, dir.Generation, sharedfsv1alpha1.ConditionPrepared, ok, res.Outcome, truncate(msg))
 	if err := r.updateStatus(ctx, &dir, before); err != nil {
 		return ctrl.Result{}, err
@@ -146,13 +154,18 @@ func (r *DirectoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 // backoff is the time left before the next attempt: after n failures, 30s doubled n-1 times, at
-// most an hour, counted from the latest attempt.
+// most an hour, counted from the latest failure.
 func backoff(dir *sharedfsv1alpha1.FilesystemShareDirectory) time.Duration {
-	if dir.Status.Failures == 0 || dir.Status.LastAttemptTime == nil {
+	if dir.Status.Failures == 0 || dir.Status.LastFailureTime == nil {
 		return 0
 	}
 	d := min(30*time.Second<<min(dir.Status.Failures-1, 7), maxBackoff)
-	return max(time.Until(dir.Status.LastAttemptTime.Add(d)), 0)
+	return max(time.Until(dir.Status.LastFailureTime.Add(d)), 0)
+}
+
+// refused reports an error that retrying at once will not fix: admission refused the object.
+func refused(err error) bool {
+	return apierrors.IsInvalid(err) || apierrors.IsForbidden(err) || apierrors.IsBadRequest(err)
 }
 
 // result reads the preparer's report. The exit code is not trusted: only the JSON in the
@@ -351,6 +364,12 @@ func (r *DirectoryReconciler) cleanup(ctx context.Context, dir *sharedfsv1alpha1
 		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: r.Preparer.Namespace, Name: name}},
 		&corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: name}},
 	} {
+		// Read from the cache first, so a prepared directory costs no API calls on later passes.
+		if err := r.Get(ctx, client.ObjectKeyFromObject(o), o); apierrors.IsNotFound(err) || (err == nil && !o.GetDeletionTimestamp().IsZero()) {
+			continue
+		} else if err != nil {
+			return err
+		}
 		if err := r.Delete(ctx, o, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
 			return err
 		}
@@ -371,7 +390,8 @@ func (r *DirectoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&sharedfsv1alpha1.FilesystemShareDirectory{}).
 		Owns(&corev1.Pod{}).
 		// A share turning Ready lets its directories be prepared.
-		Watches(&sharedfsv1alpha1.FilesystemShare{}, handler.EnqueueRequestsFromMapFunc(r.directoriesOfShare)).
+		Watches(&sharedfsv1alpha1.FilesystemShare{}, handler.EnqueueRequestsFromMapFunc(r.directoriesOfShare),
+			builder.WithPredicates(shareChanged)).
 		Named("directory").
 		Complete(r)
 }

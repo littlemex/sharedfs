@@ -3,10 +3,11 @@
 // exposing a half-made directory under its final name. It runs inside the preparer pod, which
 // mounts the parent and runs as UID 0 with CAP_CHOWN only, and reports a Result as JSON.
 //
-// The directory is made under a temporary name (".sharedfs-tmp-<random>", which no share path can
-// name because path segments may not start with "."), given its mode and then its owner through a
-// file descriptor, checked, and renamed to the final name without replacing anything. A crash
-// leaves only a temporary directory, which the next run removes. The parent must be owned by root
+// The directory is made under a temporary name derived from the final one (".sharedfs-tmp-<hash>",
+// which no share path can name because path segments may not start with "."), handed to root:root,
+// given its mode and then its owner through a file descriptor, checked, and renamed to the final
+// name without replacing anything. A crash leaves only that empty temporary directory, which the
+// next run for the same name removes; preparers of other names in the same parent leave it alone. The parent must be owned by root
 // and not writable by group or others, so no tenant can create, swap or remove entries in it.
 //
 // Every step works with CAP_CHOWN alone: the process is the owner of what it creates (no
@@ -15,14 +16,12 @@
 package prepare
 
 import (
-	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strconv"
-	"strings"
 
 	"golang.org/x/sys/unix"
 
@@ -101,14 +100,12 @@ func Run(req Request) Result {
 		return Result{Outcome: InsecureParent, Message: fmt.Sprintf(
 			"the parent directory must be owned by root and not writable by group or others (uid %d, mode %04o)", pst.Uid, uint32(pst.Mode)&permMask)}
 	}
-	removeLeftovers(parent)
+	tmp := tempName(req.Name)
+	// An interrupted run for this name; rmdir removes only an empty directory.
+	_ = unix.Unlinkat(parent, tmp, unix.AT_REMOVEDIR)
 
 	if res, ok := existing(parent, req.Name); ok {
 		return res
-	}
-	tmp, err := tempName()
-	if err != nil {
-		return Result{Outcome: Failed, Message: err.Error()}
 	}
 	if err := unix.Mkdirat(parent, tmp, 0o700); err != nil {
 		return fromErrno("creating the directory", err)
@@ -162,9 +159,12 @@ func finish(parent int, tmp string, req Request, mode uint32) Result {
 	if st.Uid != 0 {
 		return Result{Outcome: Failed, Message: fmt.Sprintf("the new directory is owned by uid %d, not root: is root squash on for this node?", st.Uid)}
 	}
-	// Mode before owner: a root-owned directory's mode, setgid included, needs no capability;
-	// after the hand-over it would need CAP_FOWNER. A setgid parent's inherited bit is
-	// overwritten here.
+	// Root's own group first: in a setgid parent the directory inherits the parent's group, and
+	// without CAP_FSETID setting setgid on a directory of a group root is not in is silently
+	// dropped. Then the mode while root still owns it (no CAP_FOWNER needed), then the owner.
+	if err := unix.Fchown(fd, 0, 0); err != nil {
+		return fromErrno("setting the owner", err)
+	}
 	if err := unix.Fchmod(fd, mode); err != nil {
 		return fromErrno("setting the mode", err)
 	}
@@ -190,29 +190,11 @@ func finish(parent int, tmp string, req Request, mode uint32) Result {
 	return observed(Created, &st, "")
 }
 
-// removeLeftovers removes empty temporary directories of interrupted runs. rmdir removes only
-// empty directories, so nothing a tenant could have written is lost.
-func removeLeftovers(parent int) {
-	dup, err := unix.Dup(parent)
-	if err != nil {
-		return
-	}
-	f := os.NewFile(uintptr(dup), "parent")
-	defer f.Close()
-	names, _ := f.Readdirnames(-1)
-	for _, n := range names {
-		if strings.HasPrefix(n, TempPrefix) {
-			_ = unix.Unlinkat(parent, n, unix.AT_REMOVEDIR)
-		}
-	}
-}
-
-func tempName() (string, error) {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return TempPrefix + hex.EncodeToString(b), nil
+// tempName is the temporary name of a directory being prepared. It is derived from the final name,
+// so concurrent preparers of different names in one parent never touch each other's.
+func tempName(name string) string {
+	sum := sha256.Sum256([]byte(name))
+	return TempPrefix + hex.EncodeToString(sum[:8])
 }
 
 func observed(outcome string, st *unix.Stat_t, msg string) Result {

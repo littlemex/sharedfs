@@ -144,6 +144,11 @@ type FilesystemShareStatus struct {
 	// volumes is the number of PersistentVolumes provisioned from this share.
 	// +optional
 	Volumes int32 `json:"volumes"`
+	// readWriteSince is when the controller first saw a ReadWrite grant on this share, cleared
+	// when none remains. Of two nested shares, the one that brought the conflict later gives way:
+	// an outer share by this time, an inner share by its creation.
+	// +optional
+	ReadWriteSince *metav1.Time `json:"readWriteSince,omitempty"`
 	// conditions: Ready.
 	// +listType=map
 	// +listMapKey=type
@@ -154,6 +159,7 @@ type FilesystemShareStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=fss,categories=sharedfs
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.provision) || self.spec.path != '/'",message="provision needs a path below the root: the root exists already"
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 250",message="name must be at most 250 characters: the StorageClasses are named <name>-rw and <name>-ro"
 // +kubebuilder:printcolumn:name="Volume",type=string,JSONPath=`.spec.persistentVolumeRef.name`
 // +kubebuilder:printcolumn:name="Path",type=string,JSONPath=`.spec.path`

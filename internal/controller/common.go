@@ -51,15 +51,15 @@ func SetupIndexes(ctx context.Context, mgr ctrl.Manager) error {
 }
 
 // shareChanged passes share events that can change a verdict about the share or its claims:
-// spec, annotations, deletion, readiness and whether it has volumes. A count that merely moves
-// does not re-run every claim of the share.
+// spec, annotations, deletion, readiness and a new verdict. A volume count that merely moves does
+// not re-run every claim and directory of the share.
 var shareChanged = predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
 	a, b := e.ObjectOld.(*sharedfsv1alpha1.FilesystemShare), e.ObjectNew.(*sharedfsv1alpha1.FilesystemShare)
 	return a.Generation != b.Generation ||
 		!maps.Equal(a.Annotations, b.Annotations) ||
 		a.DeletionTimestamp.IsZero() != b.DeletionTimestamp.IsZero() ||
 		isReady(a) != isReady(b) ||
-		(a.Status.Volumes > 0) != (b.Status.Volumes > 0)
+		a.Status.ObservedGeneration != b.Status.ObservedGeneration
 }}
 
 // ClassNames are the StorageClasses of a share.

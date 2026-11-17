@@ -58,9 +58,13 @@ type FilesystemShareDirectoryStatus struct {
 	// from 30s, doubling, to one hour.
 	// +optional
 	Failures int32 `json:"failures,omitempty"`
-	// lastAttemptTime is when the latest preparer pod was started.
+	// lastFailureTime is when the latest failure was recorded; the next attempt waits from it.
 	// +optional
-	LastAttemptTime *metav1.Time `json:"lastAttemptTime,omitempty"`
+	LastFailureTime *metav1.Time `json:"lastFailureTime,omitempty"`
+	// lastPreparer is the UID of the latest preparer pod whose outcome was recorded, so one
+	// pod is never counted twice.
+	// +optional
+	LastPreparer types.UID `json:"lastPreparer,omitempty"`
 	// conditions: Prepared.
 	// +listType=map
 	// +listMapKey=type

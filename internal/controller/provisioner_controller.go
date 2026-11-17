@@ -44,11 +44,12 @@ type ProvisionerReconciler struct {
 }
 
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemshares,verbs=get;list;watch
 // +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemsharedirectories,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemshares/finalizers,verbs=update
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 func (r *ProvisionerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -83,6 +84,10 @@ func (r *ProvisionerReconciler) provision(ctx context.Context, pvc *corev1.Persi
 		return r.pending(pvc, sharedfsv1alpha1.EventUnsupportedClaim, why)
 	}
 	ready := meta.FindStatusCondition(share.Status.Conditions, sharedfsv1alpha1.ConditionReady)
+	if share.DeletionTimestamp.IsZero() && (ready == nil || ready.ObservedGeneration != share.Generation) {
+		// Not checked since its last change: wait for the verdict instead of reporting a stale one.
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
 	if ready == nil || ready.Status != metav1.ConditionTrue || ready.ObservedGeneration != share.Generation || !share.DeletionTimestamp.IsZero() {
 		// Only the reason: the message names the source and other shares, which are the admin's.
 		msg := "it has not been checked yet"
@@ -200,9 +205,10 @@ func (r *ProvisionerReconciler) directory(ctx context.Context, pvc *corev1.Persi
 		return ctrl.Result{}, false, nil
 	}
 	if c := meta.FindStatusCondition(dir.Status.Conditions, sharedfsv1alpha1.ConditionPrepared); c == nil || c.Status != metav1.ConditionTrue {
+		// Only the reason: the message describes the controller's namespace and the parent.
 		msg := "preparing"
 		if c != nil {
-			msg = c.Reason + ": " + c.Message
+			msg = c.Reason
 		}
 		res, err := r.pending(pvc, sharedfsv1alpha1.EventDirectoryNotReady, fmt.Sprintf("directory %s (%s) is not prepared: %s", expanded, name, msg))
 		return res, true, err

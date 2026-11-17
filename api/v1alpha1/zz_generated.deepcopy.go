@@ -135,8 +135,8 @@ func (in *FilesystemShareDirectoryStatus) DeepCopyInto(out *FilesystemShareDirec
 		*out = new(ObservedDirectory)
 		**out = **in
 	}
-	if in.LastAttemptTime != nil {
-		in, out := &in.LastAttemptTime, &out.LastAttemptTime
+	if in.LastFailureTime != nil {
+		in, out := &in.LastFailureTime, &out.LastFailureTime
 		*out = (*in).DeepCopy()
 	}
 	if in.Conditions != nil {
@@ -230,6 +230,10 @@ func (in *FilesystemShareStatus) DeepCopyInto(out *FilesystemShareStatus) {
 		in, out := &in.StorageClasses, &out.StorageClasses
 		*out = new(StorageClassNames)
 		**out = **in
+	}
+	if in.ReadWriteSince != nil {
+		in, out := &in.ReadWriteSince, &out.ReadWriteSince
+		*out = (*in).DeepCopy()
 	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions

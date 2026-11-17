@@ -282,6 +282,13 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              readWriteSince:
+                description: |-
+                  readWriteSince is when the controller first saw a ReadWrite grant on this share, cleared
+                  when none remains. Of two nested shares, the one that brought the conflict later gives way:
+                  an outer share by this time, an inner share by its creation.
+                format: date-time
+                type: string
               resolved:
                 description: ResolvedSource shows what generated volumes are built
                   from.
@@ -331,6 +338,8 @@ spec:
         - spec
         type: object
         x-kubernetes-validations:
+        - message: 'provision needs a path below the root: the root exists already'
+          rule: '!has(self.spec.provision) || self.spec.path != ''/'''
         - message: 'name must be at most 250 characters: the StorageClasses are named
             <name>-rw and <name>-ro'
           rule: size(self.metadata.name) <= 250

@@ -190,6 +190,7 @@ func main() {
 		setupLog.Error(err, "Failed to configure the preparer")
 		os.Exit(1)
 	}
+	setupLog.Info("Preparer configured", "image", preparer.Image, "namespace", preparer.Namespace)
 	if err := controller.SetupIndexes(ctx, mgr); err != nil {
 		setupLog.Error(err, "Failed to set up field indexes")
 		os.Exit(1)

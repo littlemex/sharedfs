@@ -31,7 +31,6 @@ rules:
   - get
   - list
   - patch
-  - update
   - watch
 - apiGroups:
   - events.k8s.io
@@ -46,10 +45,16 @@ rules:
   - filesystemsharedirectories
   verbs:
   - create
-  - delete
   - get
   - list
   - watch
+- apiGroups:
+  - sharedfs.littlemex.github.io
+  resources:
+  - filesystemsharedirectories/finalizers
+  - filesystemshares/finalizers
+  verbs:
+  - update
 - apiGroups:
   - sharedfs.littlemex.github.io
   resources:
@@ -67,14 +72,7 @@ rules:
   - get
   - list
   - patch
-  - update
   - watch
-- apiGroups:
-  - sharedfs.littlemex.github.io
-  resources:
-  - filesystemshares/finalizers
-  verbs:
-  - update
 - apiGroups:
   - storage.k8s.io
   resources:
