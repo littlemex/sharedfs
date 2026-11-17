@@ -149,7 +149,7 @@ The controller needs no cloud credentials. Its permissions are:
 | PersistentVolumes | read, create, patch, delete |
 | PersistentVolumeClaims | read and delete in every namespace; create in its own and in `sharedfs-quota` |
 | Pods | read, create, delete in its own namespace and in `sharedfs-quota` |
-| ConfigMaps | read, create, update in its own namespace (project IDs) |
+| ConfigMaps | read and update `sharedfs-project-ids` only |
 | StorageClasses | read, create |
 | Namespaces, CSIDrivers | read |
 | FilesystemShares | read, patch, status, finalizers |
@@ -172,7 +172,7 @@ The `sharedfs-share-viewer` ClusterRole lets its holders list shares. A share's 
 | `--quota-service-account` | `sharedfs-quota` | Service account of quota pods |
 | `--quota-max-pods` | `10` | Quota pods running at once |
 | `--preparer-max-pods` | `20` | Preparer pods running at once |
-| `--quota-requires-restricted` | `true` | Provision read-write claims of shares with a quota only in namespaces at Pod Security `restricted` |
+| `--quota-requires-restricted` | `true` | On a file system where any share has a quota, provision read-write claims of every share only in namespaces at Pod Security `restricted`; claims made before are not withdrawn, and `sharedfs_quota_unrestricted_namespaces` counts what remains |
 | `--project-id-base` | `1000000` | First Lustre project ID sharedfs hands out |
 | `--preparer-node-selector` | none | `key=value,...` for preparer pods, for example nodes exempt from root squash |
 | `--preparer-tolerations` | none | JSON list of tolerations for preparer pods |
@@ -188,6 +188,9 @@ To remove sharedfs, delete the claims, then the shares, then the controller (`ma
 - **Upgrades.** v1alpha1 has no conversion. Apply the CRDs first, then the controller and the quota image together (the controller passes flags the quota image must know). The controller can be replaced at any time: a standby takes over, and deadlines, records and project IDs are all stored in the API.
 - **Backup and restore.** Back up the FilesystemShares, FilesystemShareDirectories, the provisioned PersistentVolumes and the ConfigMap `sharedfs-project-ids` together, and restore with UIDs preserved where the tool allows. Records are named after the share's UID, so a share restored under a new UID starts with no records: its claims are held (`RevocationHeld`) instead of revoked, the namespace pinning of its directories is lost, and directories with a quota report `DirectoryNotTagged` until an admin tags them with their new project IDs. Namespaces restored under new UIDs report `NamespaceRecreated`. Keep `sharedfs-project-ids` at least as high as before, so no ID is handed out twice. Exclude these volumes from file-system backups of the PVC kind: every one of them is a directory of the same shared file system.
 - **A directory removed by hand.** A record stays Prepared, so mounts fail; delete the record, then create a new claim (records are made for Pending claims), and the directory is prepared again.
+- **Mutating webhooks** that inject sidecars or environment into pods must skip `sharedfs-system` and `sharedfs-quota`: the guard refuses task pods with anything added (`PreparerNotCreated`).
+- **Retry now.** After fixing a cause (for example tagging an existing directory), annotate its record with `sharedfs.littlemex.github.io/retry=now` to skip the backoff.
+- **Metrics** are served on `:8443` by `config/default` (HTTPS, with authentication and authorization through the API server); give it a certificate for production (`--metrics-cert-path`).
 - **Quota pods pull with the node's credentials** (or a pull secret you add to the `sharedfs-quota` service account), not the controller's pull secrets.
 - **Not yet verified**: Bottlerocket and arm64 nodes, Karpenter cold starts for task pods, controller upgrade and rollback, Velero restores, more than 1,000 claims, Lustre 2.15 on PERSISTENT_2.
 - **Alerts.** A share not Ready (`sharedfs_share_ready{status="false"}`), a burst of `sharedfs_revocations_total{outcome="scheduled"}`, any `held`, and task outcomes other than success.

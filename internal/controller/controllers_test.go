@@ -635,7 +635,7 @@ var _ = Describe("Directories", func() {
 		By("the pod mounts only the parent, has CHOWN only and no token")
 		ct := pod.Spec.Containers[0]
 		Expect(ct.Image).To(Equal(preparerImage))
-		Expect(ct.Args).To(Equal([]string{"prepare-directory", "--root=/parent", "--name=" + ns.Name, "--uid=0", "--gid=1000", "--mode=2770"}))
+		Expect(ct.Args).To(Equal([]string{"prepare-directory", "--root=/parent", "--name=" + ns.Name, "--uid=0", "--gid=1000", "--mode=2770", "--owner=" + string(dir.UID)}))
 		Expect(*ct.SecurityContext.RunAsUser).To(BeZero())
 		Expect(ct.SecurityContext.Capabilities.Drop).To(Equal([]corev1.Capability{"ALL"}))
 		Expect(ct.SecurityContext.Capabilities.Add).To(Equal([]corev1.Capability{"CHOWN"}))

@@ -79,6 +79,15 @@ func (t *task) run(ctx context.Context, dir *sharedfsv1alpha1.FilesystemShareDir
 		if !canStart {
 			return ctrl.Result{}, taskIdle, nil
 		}
+		if dir.Annotations[sharedfsv1alpha1.AnnotationRetry] != "" {
+			// An admin fixed the cause and asks for a run now.
+			t.history.Failures, t.history.LastFailureTime = 0, nil
+			patch := client.MergeFrom(dir.DeepCopy())
+			delete(dir.Annotations, sharedfsv1alpha1.AnnotationRetry)
+			if err := t.Patch(ctx, dir, patch); err != nil {
+				return ctrl.Result{}, taskIdle, err
+			}
+		}
 		if wait := backoff(t.history); wait > 0 {
 			return ctrl.Result{RequeueAfter: wait}, taskIdle, nil
 		}
@@ -362,13 +371,10 @@ func taskPod(cfg PreparerConfig, image string, caps []corev1.Capability, mountPa
 
 func boolPtr(v bool) *bool { return &v }
 
-// withArch adds the controller's own CPU architecture to a node selector that names none: task
-// pods run the controller's image, built for one architecture.
+// withArch adds the controller's own OS and CPU architecture to a node selector that names
+// none: task pods run the controller's image, built for one platform.
 func withArch(sel map[string]string) map[string]string {
-	if _, ok := sel[corev1.LabelArchStable]; ok {
-		return sel
-	}
-	out := map[string]string{corev1.LabelArchStable: runtime.GOARCH}
+	out := map[string]string{corev1.LabelOSStable: runtime.GOOS, corev1.LabelArchStable: runtime.GOARCH}
 	for k, v := range sel {
 		out[k] = v
 	}

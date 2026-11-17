@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	sharedfsv1alpha1 "github.com/littlemex/sharedfs/api/v1alpha1"
+	"github.com/littlemex/sharedfs/internal/driver"
 	"github.com/littlemex/sharedfs/internal/volume"
 )
 
@@ -78,15 +79,23 @@ func quotaOnFilesystem(ctx context.Context, c client.Reader, fs string) (bool, e
 		if s.Spec.Provision == nil || s.Spec.Provision.Quota == nil {
 			continue
 		}
+		var src *volume.Source
 		var pv corev1.PersistentVolume
-		if err := c.Get(ctx, types.NamespacedName{Name: s.Spec.PersistentVolumeRef.Name}, &pv); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
+		err := c.Get(ctx, types.NamespacedName{Name: s.Spec.PersistentVolumeRef.Name}, &pv)
+		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}
-		src, err := volume.Resolve(&pv)
-		if err != nil {
+		if err == nil {
+			src, _ = volume.Resolve(&pv)
+		}
+		if src == nil && s.Status.Resolved != nil {
+			// Its source is gone or changed: judge by the copy it was last resolved to, so a
+			// missing volume never opens the gate.
+			if p, ok := driver.Lookup(s.Status.Resolved.Driver); ok {
+				src = &volume.Source{Profile: p, VolumeAttributes: s.Status.Resolved.VolumeAttributes}
+			}
+		}
+		if src == nil {
 			continue
 		}
 		if f, _ := src.Identity(); f == fs {

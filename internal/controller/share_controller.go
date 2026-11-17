@@ -207,10 +207,12 @@ func (r *ShareReconciler) records(ctx context.Context, share *sharedfsv1alpha1.F
 // quota or into another team's (measured), unless root squash is on.
 func (r *ShareReconciler) quotaWarning(ctx context.Context, share *sharedfsv1alpha1.FilesystemShare, src *volume.Source) (string, error) {
 	if !grantsReadWrite(share) {
+		metrics.QuotaUnrestricted.WithLabelValues(share.Name).Set(0)
 		return "", nil
 	}
 	fs, _ := src.Identity()
 	if quoted, err := quotaOnFilesystem(ctx, r.Client, fs); err != nil || !quoted {
+		metrics.QuotaUnrestricted.WithLabelValues(share.Name).Set(0)
 		return "", err
 	}
 	var list corev1.NamespaceList
@@ -218,6 +220,7 @@ func (r *ShareReconciler) quotaWarning(ctx context.Context, share *sharedfsv1alp
 		return "", err
 	}
 	var names []string
+	defer func() { metrics.QuotaUnrestricted.WithLabelValues(share.Name).Set(float64(len(names))) }()
 	for i := range list.Items {
 		ns := &list.Items[i]
 		if ok, _ := grantFor(share, ns, sharedfsv1alpha1.AccessReadWrite); ok && ns.Labels[podSecurityEnforce] != "restricted" {
@@ -227,11 +230,12 @@ func (r *ShareReconciler) quotaWarning(ctx context.Context, share *sharedfsv1alp
 	if len(names) == 0 {
 		return "", nil
 	}
-	if len(names) > 5 {
-		names = append(names[:5], "...")
+	shown := names
+	if len(shown) > 5 {
+		shown = append(append([]string{}, shown[:5]...), "...")
 	}
 	return fmt.Sprintf("this file system has quotas and namespaces %s are not Pod Security restricted: unless root squash is on, a root pod there can move files into or out of any quota",
-		strings.Join(names, ", ")), nil
+		strings.Join(shown, ", ")), nil
 }
 
 // checkDriver refuses drivers whose CSIDriver object would undo the guarantees: a "File"

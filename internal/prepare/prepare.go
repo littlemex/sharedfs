@@ -57,6 +57,9 @@ type Request struct {
 	Mode string
 	// ProjectID, if not 0, is given to a created directory and inherited below it.
 	ProjectID uint32
+	// Owner distinguishes the record the directory is prepared for, so two records naming the
+	// same directory never share a temporary directory.
+	Owner string
 }
 
 // Result is reported back to the controller.
@@ -104,7 +107,7 @@ func Run(req Request) Result {
 		return Result{Outcome: InsecureParent, Message: fmt.Sprintf(
 			"the parent directory must be owned by root and not writable by group or others (uid %d, mode %04o)", pst.Uid, uint32(pst.Mode)&permMask)}
 	}
-	tmp := tempName(req.Name)
+	tmp := tempName(req.Owner + "/" + req.Name)
 	// An interrupted run for this name; rmdir removes only an empty directory.
 	_ = unix.Unlinkat(parent, tmp, unix.AT_REMOVEDIR)
 
@@ -216,8 +219,9 @@ func finish(parent int, tmp string, req Request, mode uint32) Result {
 	return res
 }
 
-// tempName is the temporary name of a directory being prepared. It is derived from the final name,
-// so concurrent preparers of different names in one parent never touch each other's.
+// tempName is the temporary name of a directory being prepared, derived from the record and the
+// final name, so concurrent preparers of different names, or of different records of one name,
+// never touch each other's.
 func tempName(name string) string {
 	sum := sha256.Sum256([]byte(name))
 	return TempPrefix + hex.EncodeToString(sum[:8])

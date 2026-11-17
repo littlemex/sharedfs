@@ -58,17 +58,17 @@ func TestSetgidParentDoesNotLeakIntoMode(t *testing.T) {
 
 func TestLeftoversRemoved(t *testing.T) {
 	d := rootParent(t, 0o755)
-	if err := os.Mkdir(filepath.Join(d, tempName("x")), 0o700); err != nil {
+	if err := os.Mkdir(filepath.Join(d, tempName("/x")), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	other := filepath.Join(d, tempName("y"))
+	other := filepath.Join(d, tempName("/y"))
 	if err := os.Mkdir(other, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if r := Run(Request{Root: d, Name: "x", GID: 7, Mode: "0750"}); r.Outcome != Created {
 		t.Fatalf("%+v", r)
 	}
-	if _, err := os.Stat(filepath.Join(d, tempName("x"))); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(d, tempName("/x"))); !os.IsNotExist(err) {
 		t.Fatal("the interrupted run's temporary directory must be removed")
 	}
 	if _, err := os.Stat(other); err != nil {

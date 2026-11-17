@@ -47,6 +47,14 @@ var (
 		Help: "Preparer and quota pod results by task and reason.",
 	}, []string{"task", "reason"})
 
+	// QuotaUnrestricted is the number of granted namespaces not at Pod Security restricted, per
+	// read-write share of a file system that has quotas; claims there are refused, and claims
+	// made before are not withdrawn.
+	QuotaUnrestricted = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sharedfs_quota_unrestricted_namespaces",
+		Help: "Granted namespaces not at Pod Security restricted on file systems with quotas, per share.",
+	}, []string{"share"})
+
 	// Reclaimed counts Released volumes deleted.
 	Reclaimed = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "sharedfs_volumes_reclaimed_total",
@@ -56,7 +64,7 @@ var (
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(ShareReady, ClaimsPending, Provisioned, ProvisionLatency,
-		Revocations, TaskOutcomes, Reclaimed)
+		Revocations, TaskOutcomes, Reclaimed, QuotaUnrestricted)
 }
 
 // SetShareReady records a share's current Ready status and reason, replacing the earlier one.
@@ -68,4 +76,5 @@ func SetShareReady(share, status, reason string) {
 // ForgetShare removes a deleted share's series.
 func ForgetShare(share string) {
 	ShareReady.DeletePartialMatch(prometheus.Labels{"share": share})
+	QuotaUnrestricted.DeleteLabelValues(share)
 }

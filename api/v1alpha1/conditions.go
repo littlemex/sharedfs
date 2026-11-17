@@ -113,6 +113,10 @@ const (
 	// AnnotationPauseRevocation on a FilesystemShare holds every revocation of its claims, for
 	// an admin who sees a grant change go wrong.
 	AnnotationPauseRevocation = Group + "/pause-revocation"
+	// AnnotationRetry on a FilesystemShareDirectory runs its pending preparer or quota pod at once,
+	// skipping the backoff, for example after an admin tagged an existing directory. It is removed
+	// when acted on.
+	AnnotationRetry = Group + "/retry"
 	// AnnotationAllowOverlap on a FilesystemShare exempts it from the overlap guard, for an
 	// admin's own root share.
 	AnnotationAllowOverlap = Group + "/allow-overlap"

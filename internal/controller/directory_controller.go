@@ -91,6 +91,7 @@ func (r *DirectoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			"--uid=" + strconv.FormatInt(p.UID, 10),
 			"--gid=" + strconv.FormatInt(p.GID, 10),
 			"--mode=" + p.Mode,
+			"--owner=" + string(dir.UID),
 		}
 		if dir.Spec.ProjectID != 0 {
 			args = append(args, "--project-id="+strconv.FormatInt(dir.Spec.ProjectID, 10))

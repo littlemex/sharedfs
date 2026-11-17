@@ -91,7 +91,7 @@ func main() {
 	flag.IntVar(&preparerMaxPods, "preparer-max-pods", 20, "Most preparer pods running at once.")
 	var quotaRequiresRestricted bool
 	flag.BoolVar(&quotaRequiresRestricted, "quota-requires-restricted", true,
-		"Refuse read-write claims of shares with a quota from namespaces that do not enforce Pod Security restricted; "+
+		"On a file system where any share has a quota, refuse read-write claims of every share from namespaces that do not enforce Pod Security restricted; "+
 			"turn off only where root squash keeps pods from writing as root.")
 	flag.IntVar(&quotaMaxPods, "quota-max-pods", 10, "Most quota pods running at once.")
 	flag.StringVar(&quotaNamespace, "quota-namespace", "",

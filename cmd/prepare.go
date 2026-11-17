@@ -37,6 +37,7 @@ func prepareDirectory(args []string) int {
 	fs.IntVar(&req.GID, "gid", -1, "owner gid")
 	fs.StringVar(&req.Mode, "mode", "", "octal mode, for example 2770")
 	projectID := fs.Uint("project-id", 0, "Lustre project ID for a created directory, 0 for none")
+	fs.StringVar(&req.Owner, "owner", "", "the record the directory is prepared for")
 	out := fs.String("report", terminationLog, "file the JSON result is written to")
 	var res prepare.Result
 	if err := fs.Parse(args); err != nil || req.Root == "" || req.Name == "" || req.GID < 0 || req.UID < 0 || req.Mode == "" {
