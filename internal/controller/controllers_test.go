@@ -243,14 +243,24 @@ var _ = Describe("FilesystemShare API", func() {
 	It("keeps everything but the grants immutable and refuses empty selectors", func() {
 		s := share(uniq("imm"), "none", "datasets", grant("x", sharedfsv1alpha1.AccessReadOnly))
 		create(s)
+		// Wait for the controller's finalizer, so the updates below cannot fail on a conflict.
+		Eventually(func(g Gomega) []string {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(s), s)).To(Succeed())
+			return s.Finalizers
+		}, timeout, interval).Should(ContainElement(sharedfsv1alpha1.Finalizer))
 		s.Spec.Path = "models"
-		Expect(k8sClient.Update(ctx, s)).NotTo(Succeed())
+		Expect(apierrors.IsInvalid(k8sClient.Update(ctx, s))).To(BeTrue())
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(s), s)).To(Succeed())
 		s.Spec.Grants = []sharedfsv1alpha1.Grant{{Access: sharedfsv1alpha1.AccessReadWrite}}
-		Expect(k8sClient.Update(ctx, s)).NotTo(Succeed())
-		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(s), s)).To(Succeed())
-		s.Spec.Grants = []sharedfsv1alpha1.Grant{grant("y", sharedfsv1alpha1.AccessReadWrite)}
-		Expect(k8sClient.Update(ctx, s)).To(Succeed())
+		Expect(apierrors.IsInvalid(k8sClient.Update(ctx, s))).To(BeTrue())
+		// The controller adds its finalizer meanwhile, so retry on a conflict.
+		Eventually(func() error {
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(s), s); err != nil {
+				return err
+			}
+			s.Spec.Grants = []sharedfsv1alpha1.Grant{grant("y", sharedfsv1alpha1.AccessReadWrite)}
+			return k8sClient.Update(ctx, s)
+		}, timeout, interval).Should(Succeed())
 		Expect(k8sClient.Delete(ctx, s)).To(Succeed())
 	})
 })
@@ -299,6 +309,8 @@ var _ = Describe("FilesystemShare", func() {
 		outer := share(uniq("outer"), src.Name, "teams", grant("a", sharedfsv1alpha1.AccessReadWrite))
 		create(src, outer)
 		readyShare(outer)
+		// Creation times have a resolution of one second; within one second the UID decides.
+		time.Sleep(1100 * time.Millisecond)
 		inner := share(uniq("inner"), src.Name, "teams/{namespace}", grant("b", sharedfsv1alpha1.AccessReadWrite))
 		create(inner)
 		Eventually(readyOf(inner), timeout, interval).Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonOverlappingShare))
