@@ -245,7 +245,7 @@ It writes only below one directory of the file system, which it removes at the e
 - a recreated namespace;
 - deletion of a share that still has volumes.
 
-[test/e2e-eks/quota.sh](test/e2e-eks/quota.sh) checks quotas on a Lustre 2.15 file system: the project ID and limits of a new directory, a tenant stopped at the limit, a raised limit, and a directory that existed before. [test/e2e-eks/scale.sh](test/e2e-eks/scale.sh) creates many claims at once, kills the leader while they bind and again during revocation, and stops the controller while claims come and go.
+[test/e2e-eks/density.sh](test/e2e-eks/density.sh) runs many pods with a volume each on one node. [test/e2e-eks/quota.sh](test/e2e-eks/quota.sh) checks quotas on a Lustre 2.15 file system: the project ID and limits of a new directory, a tenant stopped at the limit, a raised limit, and a directory that existed before. [test/e2e-eks/scale.sh](test/e2e-eks/scale.sh) creates many claims at once, kills the leader while they bind and again during revocation, and stops the controller while claims come and go.
 
 The preparer's file system logic is also tested as root with only `CAP_CHOWN`, in a container:
 

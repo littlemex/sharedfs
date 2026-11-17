@@ -2,6 +2,8 @@
 # End-to-end check of per-directory project quotas on a real cluster with FSx for Lustre 2.15.
 #
 # Usage: test/e2e-eks/quota.sh <source PV name> <node name>
+#   TENANT_NODE  runs the tenant pod on another node, for example one subject to root squash while
+#                <node> (the admin pod) and the preparer and quota pods are exempt
 #   The controller must run with --quota-namespace and --quota-image (config/quota).
 #
 # Creates namespaces sfsq-<id>-{admin,team,old}, writes only below the directory sfsq-<id> of the
@@ -116,7 +118,7 @@ apiVersion: v1
 kind: Pod
 metadata: {name: w, namespace: $NS_TEAM}
 spec:
-  nodeSelector: {kubernetes.io/hostname: $NODE}
+  nodeSelector: {kubernetes.io/hostname: ${TENANT_NODE:-$NODE}}
   restartPolicy: Never
   terminationGracePeriodSeconds: 1
   securityContext: {runAsUser: 1000, runAsGroup: 2000, supplementalGroups: [2000], runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}

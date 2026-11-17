@@ -40,6 +40,8 @@ On EKS 1.35 with the FSx CSI drivers named below, FSx for Lustre file systems of
 | M23 | 1,000 claims in 40 namespaces are all Bound 259 s after they are created, with the leader killed at 111; exactly one volume per claim. The leader's memory is about 45 MiB with 800 PersistentVolumes and claims cached | `test/e2e-eks/scale.sh`, kubelet stats |
 | M24 | On Lustre 2.15, a root process in a tenant pod at Pod Security baseline changes the project ID of files and directories it does not own, also with `CAP_FOWNER` dropped; a non-root owner is refused | probe pods |
 | M25 | Renaming a directory with its own project ID into a parent that carries a project ID with inheritance fails with `EXDEV` | the preparer on a tagged parent |
+| M26 | With root squash on and only one node exempt, a root process in a tenant pod on another node cannot list a 2770 directory of another owner, change a project ID, chown or write; preparer and quota pods on the exempt node work, and the quota e2e passes with the tenant on the squashed node | probe pod; `test/e2e-eks/quota.sh` with `TENANT_NODE` |
+| M27 | 100 pods on one node, each with its own sharedfs volume, are all Running 35 s after they are created and all read their mount; the node's memory grows by 544 MiB, pods included; transient FailedMount events (11) resolve by themselves; deleting the pods reclaims every volume in 51 s | `test/e2e-eks/density.sh` |
 
 ## API
 
