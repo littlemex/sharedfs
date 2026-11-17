@@ -1,0 +1,13 @@
+# Lets tenants read the share catalogue: which shares exist, their paths and their StorageClass
+# names. Bind it to the groups that should see the catalogue.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: share-viewer
+  labels:
+    app.kubernetes.io/name: sharedfs
+    app.kubernetes.io/managed-by: kustomize
+rules:
+- apiGroups: ["sharedfs.littlemex.github.io"]
+  resources: ["filesystemshares"]
+  verbs: ["get", "list", "watch"]

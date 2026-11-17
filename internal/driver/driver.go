@@ -24,6 +24,17 @@ type Profile struct {
 	// AccessMode is the access mode generated volumes use. Read-only is enforced with the ro
 	// mount option instead, since neither driver accepts ReadOnlyMany.
 	AccessMode corev1.PersistentVolumeAccessMode
+	// SubPath says how to mount a directory below the file system root, or is nil when the
+	// driver cannot.
+	SubPath *SubPath
+}
+
+// SubPath mounts a directory by appending it to one volume attribute.
+type SubPath struct {
+	// Attribute is the volumeAttributes key the directory is appended to.
+	Attribute string
+	// Default is the attribute's value when the source does not set it, as the driver assumes.
+	Default string
 }
 
 // For every profile the volumeHandle is an identifier only and the mount source comes from
@@ -33,15 +44,20 @@ var profiles = []Profile{
 		// kubernetes-sigs/aws-fsx-csi-driver@5ede23e pkg/driver/node.go NodePublishVolume:
 		// source = "<dnsname>@tcp:/<mountname>" (mountname defaults to "fsx").
 		// controller.go volumeCaps: SINGLE_NODE_WRITER, MULTI_NODE_MULTI_WRITER.
+		// A directory is mounted as a Lustre fileset, "<mountname>/<dir>"; the path is resolved
+		// by Lustre, which does not follow symlinks in it (measured, see docs/DESIGN.md).
 		Name:               "fsx.csi.aws.com",
 		RequiredAttributes: []string{"dnsname"},
 		OptionalAttributes: []string{"mountname"},
 		AccessMode:         corev1.ReadWriteMany,
+		SubPath:            &SubPath{Attribute: "mountname", Default: "fsx"},
 	},
 	{
 		// kubernetes-sigs/aws-fsx-openzfs-csi-driver@93c640d pkg/driver/node.go NodePublishVolume:
 		// source = "<DNSName>:<VolumePath>" (VolumePath defaults to "fsx" for a file system).
 		// controller.go volumeCaps: SINGLE_NODE_WRITER, MULTI_NODE_MULTI_WRITER.
+		// No sub-directories: NodePublishVolume rejects any VolumePath other than the root for
+		// ResourceType filesystem.
 		Name:               "fsx.openzfs.csi.aws.com",
 		RequiredAttributes: []string{"DNSName", "ResourceType"},
 		OptionalAttributes: []string{"VolumePath"},

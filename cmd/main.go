@@ -26,10 +26,13 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -54,6 +57,9 @@ func init() {
 
 // nolint:gocyclo
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == prepareCommand {
+		os.Exit(prepareDirectory(os.Args[2:]))
+	}
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var enableLeaderElection bool
@@ -64,6 +70,15 @@ func main() {
 	var revocationGracePeriod time.Duration
 	flag.DurationVar(&revocationGracePeriod, "revocation-grace-period", 30*time.Second,
 		"How long a claim must stay ungranted before its PersistentVolumeClaim is deleted.")
+	var preparerImage, preparerServiceAccount, preparerNodeSelector, preparerTolerations string
+	flag.StringVar(&preparerImage, "preparer-image", "",
+		"Image of preparer pods. Empty means this controller's own image, read from its pod.")
+	flag.StringVar(&preparerServiceAccount, "preparer-service-account", "sharedfs-preparer",
+		"Service account of preparer pods; it needs no permissions and its token is not mounted.")
+	flag.StringVar(&preparerNodeSelector, "preparer-node-selector", "",
+		"Comma-separated key=value node labels for preparer pods, for example nodes exempt from root squash.")
+	flag.StringVar(&preparerTolerations, "preparer-tolerations", "",
+		"JSON list of tolerations for preparer pods.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -136,8 +151,18 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
+	// Preparer pods exist only in the controller's namespace, and the controller may only read
+	// pods there.
+	podNamespace := os.Getenv("POD_NAMESPACE")
+	if podNamespace == "" {
+		setupLog.Error(nil, "POD_NAMESPACE must name the controller's namespace")
+		os.Exit(1)
+	}
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
+		Scheme: scheme,
+		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
+			&corev1.Pod{}: {Namespaces: map[string]cache.Config{podNamespace: {}}},
+		}},
 		Metrics:                metricsServerOptions,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
@@ -160,35 +185,31 @@ func main() {
 	}
 
 	ctx := ctrl.SetupSignalHandler()
+	preparer, err := preparerConfig(ctx, mgr.GetAPIReader(), preparerImage, preparerServiceAccount, preparerNodeSelector, preparerTolerations)
+	if err != nil {
+		setupLog.Error(err, "Failed to configure the preparer")
+		os.Exit(1)
+	}
 	if err := controller.SetupIndexes(ctx, mgr); err != nil {
 		setupLog.Error(err, "Failed to set up field indexes")
 		os.Exit(1)
 	}
-	if err := (&controller.SharedFilesystemReconciler{
-		Client:    mgr.GetClient(),
-		APIReader: mgr.GetAPIReader(),
-		Recorder:  mgr.GetEventRecorder("sharedfs"),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to create controller", "controller", "sharedfilesystem")
-		os.Exit(1)
-	}
-	if err := (&controller.SharedFilesystemClaimReconciler{
-		Client:    mgr.GetClient(),
-		APIReader: mgr.GetAPIReader(),
-		Scheme:    mgr.GetScheme(),
-		Recorder:  mgr.GetEventRecorder("sharedfs"),
-
-		RevocationGracePeriod: revocationGracePeriod,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to create controller", "controller", "sharedfilesystemclaim")
-		os.Exit(1)
-	}
-	if err := (&controller.OrphanReconciler{
-		Client:    mgr.GetClient(),
-		APIReader: mgr.GetAPIReader(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to create controller", "controller", "orphan-volume")
-		os.Exit(1)
+	recorder := mgr.GetEventRecorder("sharedfs")
+	for name, r := range map[string]interface{ SetupWithManager(ctrl.Manager) error }{
+		"filesystemshare": &controller.ShareReconciler{
+			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: recorder,
+		},
+		"provisioner": &controller.ProvisionerReconciler{
+			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: recorder,
+			RevocationGracePeriod: revocationGracePeriod,
+		},
+		"directory": &controller.DirectoryReconciler{Client: mgr.GetClient(), Preparer: preparer},
+		"reclaim":   &controller.ReclaimReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()},
+	} {
+		if err := r.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", name)
+			os.Exit(1)
+		}
 	}
 	// +kubebuilder:scaffold:builder
 

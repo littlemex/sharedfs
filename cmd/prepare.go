@@ -1,0 +1,97 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/littlemex/sharedfs/internal/controller"
+	"github.com/littlemex/sharedfs/internal/prepare"
+)
+
+const (
+	prepareCommand = "prepare-directory"
+	// terminationLog is where kubelet reads the container's termination message.
+	terminationLog = "/dev/termination-log"
+)
+
+// prepareDirectory is the preparer pod's entry point. It always exits 0 once it has a result:
+// the controller decides from the JSON report, never from the exit code.
+func prepareDirectory(args []string) int {
+	fs := flag.NewFlagSet(prepareCommand, flag.ContinueOnError)
+	var req prepare.Request
+	fs.StringVar(&req.Root, "root", "", "mounted parent directory")
+	fs.StringVar(&req.Name, "name", "", "directory to create in root: one path segment")
+	fs.IntVar(&req.UID, "uid", 0, "owner uid")
+	fs.IntVar(&req.GID, "gid", -1, "owner gid")
+	fs.StringVar(&req.Mode, "mode", "", "octal mode, for example 2770")
+	out := fs.String("report", terminationLog, "file the JSON result is written to")
+	var res prepare.Result
+	if err := fs.Parse(args); err != nil || req.Root == "" || req.Name == "" || req.GID < 0 || req.UID < 0 || req.Mode == "" {
+		res = prepare.Result{Outcome: prepare.Failed, Message: fmt.Sprintf("bad arguments %q", args)}
+	} else {
+		res = prepare.Run(req)
+	}
+	report := res.JSON()
+	fmt.Println(report)
+	if err := os.WriteFile(*out, []byte(report), 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, "writing the report:", err)
+		return 1
+	}
+	return 0
+}
+
+// preparerConfig resolves where preparer pods run. The image defaults to the controller's own,
+// read from its pod, so the two can never drift apart.
+func preparerConfig(ctx context.Context, c client.Reader, image, sa, nodeSelector, tolerations string) (controller.PreparerConfig, error) {
+	cfg := controller.PreparerConfig{
+		Namespace:      os.Getenv("POD_NAMESPACE"),
+		Image:          image,
+		ServiceAccount: sa,
+	}
+	if cfg.Namespace == "" {
+		return cfg, errors.New("POD_NAMESPACE is not set")
+	}
+	if cfg.Image == "" {
+		name := os.Getenv("POD_NAME")
+		if name == "" {
+			return cfg, errors.New("set --preparer-image, or POD_NAME so the controller can read its own image")
+		}
+		var pod corev1.Pod
+		if err := c.Get(ctx, types.NamespacedName{Namespace: cfg.Namespace, Name: name}, &pod); err != nil {
+			return cfg, fmt.Errorf("reading own pod for the preparer image: %w", err)
+		}
+		for _, ct := range pod.Spec.Containers {
+			if ct.Name == "manager" {
+				cfg.Image = ct.Image
+			}
+		}
+		if cfg.Image == "" {
+			return cfg, errors.New("own pod has no container named manager")
+		}
+	}
+	if nodeSelector != "" {
+		cfg.NodeSelector = map[string]string{}
+		for _, kv := range strings.Split(nodeSelector, ",") {
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok || k == "" {
+				return cfg, fmt.Errorf("--preparer-node-selector: %q is not key=value", kv)
+			}
+			cfg.NodeSelector[k] = v
+		}
+	}
+	if tolerations != "" {
+		if err := json.Unmarshal([]byte(tolerations), &cfg.Tolerations); err != nil {
+			return cfg, fmt.Errorf("--preparer-tolerations: %w", err)
+		}
+	}
+	return cfg, nil
+}

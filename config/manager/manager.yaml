@@ -5,6 +5,11 @@ metadata:
     control-plane: controller-manager
     app.kubernetes.io/name: sharedfs
     app.kubernetes.io/managed-by: kustomize
+    # Preparer pods run as UID 0 with CAP_CHOWN only, which baseline allows and restricted does
+    # not. Nothing but the controller runs here. If Kueue manages plain pods, exclude this
+    # namespace from it, or preparer pods wait on a scheduling gate.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: baseline
   name: system
 ---
 apiVersion: apps/v1
@@ -65,6 +70,15 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         ports:
         - containerPort: 8081
           name: health

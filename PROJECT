@@ -14,16 +14,15 @@ resources:
   controller: true
   domain: littlemex.github.io
   group: sharedfs
-  kind: SharedFilesystem
+  kind: FilesystemShare
   path: github.com/littlemex/sharedfs/api/v1alpha1
   version: v1alpha1
 - api:
     crdVersion: v1
-    namespaced: true
   controller: true
   domain: littlemex.github.io
   group: sharedfs
-  kind: SharedFilesystemClaim
+  kind: FilesystemShareDirectory
   path: github.com/littlemex/sharedfs/api/v1alpha1
   version: v1alpha1
 version: "3"

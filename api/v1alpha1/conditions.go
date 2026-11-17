@@ -16,75 +16,89 @@ limitations under the License.
 
 package v1alpha1
 
-// Condition types and reasons are part of the API: tools and people match on them. Every reason
-// names one cause.
+// Condition types and reasons are part of the API. Every reason names one cause.
 const (
-	// ConditionReady is set on both kinds. On a SharedFilesystem it means the source resolves
-	// and claims can be accepted. On a claim it means Accepted and Bound and nothing pending.
+	// ConditionReady is set on a FilesystemShare: new claims can be provisioned.
 	ConditionReady = "Ready"
-	// ConditionAccepted is set on claims: the namespace is granted the requested access, and
-	// the filesystem and its source can be used.
-	ConditionAccepted = "Accepted"
-	// ConditionBound is set on claims and reports facts about the generated PVC and PV,
-	// whether or not the claim is currently accepted.
-	ConditionBound = "Bound"
+	// ConditionPrepared is set on a FilesystemShareDirectory: the directory exists as required.
+	ConditionPrepared = "Prepared"
 )
 
-// Reasons of SharedFilesystem Ready.
+// Reasons of FilesystemShare Ready.
 const (
-	ReasonResolved          = "Resolved"
-	ReasonSourceNotFound    = "SourceNotFound"
-	ReasonSourceNotCSI      = "SourceNotCSI"
-	ReasonUnsupportedDriver = "UnsupportedDriver"
-	ReasonSourceIsGenerated = "SourceIsGenerated"
-	ReasonInvalidSource     = "InvalidSource"
-	ReasonInvalidGrant      = "InvalidGrant"
-	ReasonVolumesRemaining  = "VolumesRemaining"
+	ReasonResolved           = "Resolved"
+	ReasonSourceNotFound     = "SourceNotFound"
+	ReasonSourceNotCSI       = "SourceNotCSI"
+	ReasonUnsupportedDriver  = "UnsupportedDriver"
+	ReasonSourceIsGenerated  = "SourceIsGenerated"
+	ReasonInvalidSource      = "InvalidSource"
+	ReasonSourceUnreserved   = "SourceUnreserved"
+	ReasonInvalidPath        = "InvalidPath"
+	ReasonSubPathUnsupported = "SubPathUnsupported"
+	ReasonInvalidGrant       = "InvalidGrant"
+	ReasonUnsafeDriverPolicy = "UnsafeDriverPolicy"
+	ReasonOverlappingShare   = "OverlappingShare"
+	ReasonStorageClassTaken  = "StorageClassTaken"
+	ReasonVolumesRemaining   = "VolumesRemaining"
 )
 
-// Reasons of claim Accepted. NamespaceNotGranted, AccessNotGranted and FilesystemNotFound
-// withdraw access when they persist past the revocation grace period; the others leave existing
-// volumes in place.
+// Reasons of FilesystemShareDirectory Prepared.
 const (
-	ReasonAccepted            = "Accepted"
-	ReasonNamespaceNotGranted = "NamespaceNotGranted"
-	ReasonAccessNotGranted    = "AccessNotGranted"
-	ReasonFilesystemNotFound  = "FilesystemNotFound"
-	ReasonFilesystemDeleting  = "FilesystemDeleting"
-	// A claim whose filesystem cannot be used carries the filesystem's own Ready reason
-	// (SourceNotFound, UnsupportedDriver, InvalidGrant, ...), so each reason names one cause.
+	ReasonDirectoryCreated  = "DirectoryCreated"
+	ReasonDirectoryExists   = "DirectoryExists"
+	ReasonPreparing         = "Preparing"
+	ReasonParentNotFound    = "ParentNotFound"
+	ReasonInsecureParent    = "InsecureParent"
+	ReasonNotADirectory     = "NotADirectory"
+	ReasonPermissionDenied  = "PermissionDenied"
+	ReasonPreparationFailed = "PreparationFailed"
 )
 
-// Reasons of claim Bound.
+// Event reasons on PersistentVolumeClaims.
 const (
-	ReasonBound             = "Bound"
-	ReasonNoVolume          = "NoVolume"
-	ReasonPVCPending        = "PVCPending"
-	ReasonPVCConflict       = "PVCConflict"
-	ReasonPVCTerminating    = "PVCTerminating"
-	ReasonPVCLost           = "PVCLost"
-	ReasonPVCCreateFailed   = "PVCCreateFailed"
-	ReasonVolumeApplyFailed = "VolumeApplyFailed"
-	ReasonVolumeTerminating = "VolumeTerminating"
-)
-
-// Reasons of claim Ready besides the ones it copies from Accepted and Bound.
-const (
-	ReasonReady         = "Ready"
-	ReasonRevoking      = "Revoking"
-	ReasonSourceChanged = "SourceChanged"
-	ReasonDeleting      = "Deleting"
+	EventNotGranted         = "NotGranted"
+	EventUnsupportedClaim   = "UnsupportedClaim"
+	EventShareNotReady      = "ShareNotReady"
+	EventNamespaceRecreated = "NamespaceRecreated"
+	EventDirectoryNotReady  = "DirectoryNotReady"
+	EventProvisioned        = "Provisioned"
+	EventRevoking           = "Revoking"
+	EventRevoked            = "Revoked"
 )
 
 // Names sharedfs puts on the objects it manages.
 const (
-	// Finalizer is set on both kinds.
-	Finalizer = "sharedfs.littlemex.github.io/cleanup"
-	// LabelClaimUID marks a generated PersistentVolume or PersistentVolumeClaim with the UID of
-	// its claim. Labels carry UIDs only: names can be longer than a label value allows.
-	LabelClaimUID = "sharedfs.littlemex.github.io/claim-uid"
-	// LabelFilesystemUID marks a generated PersistentVolume with the UID of its SharedFilesystem.
-	LabelFilesystemUID = "sharedfs.littlemex.github.io/filesystem-uid"
-	// AnnotationFilesystemName names the SharedFilesystem of a generated PersistentVolume.
-	AnnotationFilesystemName = "sharedfs.littlemex.github.io/filesystem-name"
+	// Group is the API group, also the provisioner name of the StorageClasses.
+	Group = "sharedfs.littlemex.github.io"
+	// ProvisionerName is the provisioner of the StorageClasses a FilesystemShare owns.
+	ProvisionerName = Group
+
+	// Finalizer is set on FilesystemShares.
+	Finalizer = Group + "/cleanup"
+
+	// LabelShareUID marks generated PersistentVolumes, StorageClasses and directory records.
+	LabelShareUID = Group + "/share-uid"
+	// LabelPVCUID marks a generated PersistentVolume with the UID of its claim.
+	LabelPVCUID = Group + "/pvc-uid"
+	// LabelInternal marks the controller's own volumes and claims used to prepare directories.
+	// They are never treated as tenant volumes.
+	LabelInternal = Group + "/internal"
+
+	// AnnotationShareName names the FilesystemShare of a generated object.
+	AnnotationShareName = Group + "/share-name"
+	// AnnotationAccess records on a generated PersistentVolume the access it was provisioned
+	// with, so revocation does not depend on the StorageClass still existing.
+	AnnotationAccess = Group + "/access"
+	// AnnotationWithdrawAfter is set on a generated PersistentVolume, an object only admins
+	// can edit, while its claim's namespace is not granted: the RFC 3339 time after which the
+	// claim is deleted if the grant is still missing.
+	AnnotationWithdrawAfter = Group + "/withdraw-after"
+	// AnnotationAllowOverlap on a FilesystemShare exempts it from the overlap guard, for an
+	// admin's own root share.
+	AnnotationAllowOverlap = Group + "/allow-overlap"
+
+	// StorageClass parameters that tie a class to its share and access.
+	ParameterShare    = "share"
+	ParameterShareUID = "shareUID"
+	ParameterAccess   = "access"
 )

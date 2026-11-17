@@ -4,26 +4,34 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
-  name: sharedfilesystems.sharedfs.littlemex.github.io
+  name: filesystemshares.sharedfs.littlemex.github.io
 spec:
   group: sharedfs.littlemex.github.io
   names:
     categories:
     - sharedfs
-    kind: SharedFilesystem
-    listKind: SharedFilesystemList
-    plural: sharedfilesystems
+    kind: FilesystemShare
+    listKind: FilesystemShareList
+    plural: filesystemshares
     shortNames:
-    - sfs
-    singular: sharedfilesystem
+    - fss
+    singular: filesystemshare
   scope: Cluster
   versions:
   - additionalPrinterColumns:
     - jsonPath: .spec.persistentVolumeRef.name
       name: Volume
       type: string
-    - jsonPath: .status.resolved.driver
-      name: Driver
+    - jsonPath: .spec.path
+      name: Path
+      type: string
+    - jsonPath: .status.storageClasses.readWrite
+      name: RW-Class
+      priority: 1
+      type: string
+    - jsonPath: .status.storageClasses.readOnly
+      name: RO-Class
+      priority: 1
       type: string
     - jsonPath: .status.volumes
       name: Volumes
@@ -41,8 +49,9 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          SharedFilesystem offers one existing file system, through its static PersistentVolume, to the
-          namespaces its grants select. It is created by the platform admin.
+          FilesystemShare offers one path of an existing file system to the namespaces its grants
+          select. Tenants claim it with an ordinary PersistentVolumeClaim of one of its two
+          StorageClasses. It is created by the platform admin.
         properties:
           apiVersion:
             description: |-
@@ -62,32 +71,30 @@ spec:
           metadata:
             type: object
           spec:
-            description: SharedFilesystemSpec offers one existing file system to the
-              namespaces its grants select.
+            description: |-
+              FilesystemShareSpec offers one path of an existing file system to the namespaces its grants
+              select. The whole spec except grants is immutable.
             properties:
               grants:
                 description: |-
-                  grants decide which namespaces may claim the file system. A namespace selected by
-                  several grants gets the strongest access among them. With no grants, no namespace may.
+                  grants decide which namespaces may claim the share. A claim is provisioned only when a
+                  single grant selects its namespace and allows the access of the StorageClass it uses.
                 items:
-                  description: Grant lets the namespaces it selects mount the file
-                    system with at most the given access.
+                  description: Grant lets the namespaces it selects claim the share
+                    with at most the given access.
                   properties:
                     access:
-                      default: ReadOnly
                       description: access is the strongest mount the selected namespaces
-                        may ask for.
+                        may claim.
                       enum:
                       - ReadOnly
                       - ReadWrite
                       type: string
                     namespaceSelector:
                       description: |-
-                        namespaceSelector matches namespace labels. It must not be empty, so a selector whose
-                        fields were dropped by a typo does not grant every namespace; to grant every namespace,
-                        match kubernetes.io/metadata.name with operator Exists. To name namespaces one by one,
-                        match kubernetes.io/metadata.name with In. Tenants must not be able to edit the labels
-                        this selector reads.
+                        namespaceSelector matches namespace labels and must not be empty, so a selector whose
+                        fields were dropped by a typo does not grant every namespace. Tenants must not be able to
+                        edit the labels it reads.
                       properties:
                         matchExpressions:
                           description: matchExpressions is a list of label selector
@@ -133,6 +140,7 @@ spec:
                       type: object
                       x-kubernetes-map-type: atomic
                   required:
+                  - access
                   - namespaceSelector
                   type: object
                   x-kubernetes-validations:
@@ -144,11 +152,24 @@ spec:
                 maxItems: 16
                 type: array
                 x-kubernetes-list-type: atomic
+              path:
+                description: |-
+                  path inside the file system that the share exposes: "/" for the root, or a relative path
+                  such as "datasets" or "checkpoints/{namespace}". "{namespace}" takes a whole segment and
+                  expands to the namespace of the claiming PersistentVolumeClaim. Drivers without
+                  sub-directory mounts accept only "/".
+                maxLength: 1024
+                type: string
+                x-kubernetes-validations:
+                - message: path must be "/" or relative segments of [A-Za-z0-9._-]
+                    (not starting with "." or "-") or "{namespace}"
+                  rule: self == '/' || (self.matches('^([{]namespace[}]|[A-Za-z0-9_][A-Za-z0-9._-]*)(/([{]namespace[}]|[A-Za-z0-9_][A-Za-z0-9._-]*))*$')
+                    && !self.matches('[^/]{256}') && !self.matches('^([^/]*/){32}'))
               persistentVolumeRef:
                 description: |-
-                  persistentVolumeRef names the existing static PersistentVolume that points at the file
-                  system. Its CSI fields are copied into every generated PersistentVolume; the
-                  PersistentVolume itself is only read, and its phase does not matter. Immutable.
+                  persistentVolumeRef names the existing static PersistentVolume of the file system. It is
+                  only read. It must be bound or reserved with claimRef, otherwise any namespace could bind
+                  it directly.
                 properties:
                   name:
                     description: name of the PersistentVolume.
@@ -158,15 +179,45 @@ spec:
                 required:
                 - name
                 type: object
-                x-kubernetes-validations:
-                - message: persistentVolumeRef is immutable; create a new SharedFilesystem
-                    instead
-                  rule: self == oldSelf
+              provision:
+                description: |-
+                  provision creates the directory when a granted namespace first claims the share.
+                  Without it the directory must already exist; a missing one fails the mount.
+                properties:
+                  gid:
+                    description: |-
+                      gid is the group of the created directory. Pods write through it, for example with
+                      runAsGroup or supplementalGroups.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                  mode:
+                    default: "2770"
+                    description: |-
+                      mode of the created directory, octal; the setgid bit (2770) makes new files inherit gid.
+                      setuid and sticky are not allowed.
+                    pattern: ^0?[02]?[0-7]{3}$
+                    type: string
+                  uid:
+                    default: 0
+                    description: uid owns the created directory.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                required:
+                - gid
+                type: object
             required:
+            - path
             - persistentVolumeRef
             type: object
+            x-kubernetes-validations:
+            - message: only grants can change; create a new FilesystemShare instead
+              rule: self.persistentVolumeRef == oldSelf.persistentVolumeRef && self.path
+                == oldSelf.path && (has(self.provision) == has(oldSelf.provision))
+                && (!has(self.provision) || self.provision == oldSelf.provision)
           status:
-            description: SharedFilesystemStatus is the observed state of a SharedFilesystem.
+            description: FilesystemShareStatus is the observed state of a FilesystemShare.
             properties:
               conditions:
                 description: 'conditions: Ready.'
@@ -229,25 +280,21 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               observedGeneration:
-                description: observedGeneration is the generation this status was
-                  computed from.
                 format: int64
                 type: integer
               resolved:
-                description: resolved is the source as last read successfully.
+                description: ResolvedSource shows what generated volumes are built
+                  from.
                 properties:
                   capacity:
                     anyOf:
                     - type: integer
                     - type: string
-                    description: capacity of the source PersistentVolume.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
                   driver:
-                    description: driver is the CSI driver name.
                     type: string
                   mountOptions:
-                    description: mountOptions of the source without any rw or ro option.
                     items:
                       type: string
                     type: array
@@ -255,19 +302,28 @@ spec:
                   volumeAttributes:
                     additionalProperties:
                       type: string
-                    description: volumeAttributes copied for the keys the driver reads.
                     type: object
                   volumeHandle:
-                    description: volumeHandle of the source PersistentVolume.
                     type: string
                 required:
                 - capacity
                 - driver
                 - volumeHandle
                 type: object
+              storageClasses:
+                description: storageClasses tenants claim the share through.
+                properties:
+                  readOnly:
+                    type: string
+                  readWrite:
+                    type: string
+                required:
+                - readOnly
+                - readWrite
+                type: object
               volumes:
-                description: volumes is the number of generated PersistentVolumes
-                  that point at this file system.
+                description: volumes is the number of PersistentVolumes provisioned
+                  from this share.
                 format: int32
                 type: integer
             type: object

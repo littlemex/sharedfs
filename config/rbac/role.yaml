@@ -16,6 +16,14 @@ rules:
   - ""
   resources:
   - persistentvolumeclaims
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - persistentvolumes
   verbs:
   - create
@@ -26,12 +34,6 @@ rules:
   - update
   - watch
 - apiGroups:
-  - ""
-  resources:
-  - pods
-  verbs:
-  - list
-- apiGroups:
   - events.k8s.io
   resources:
   - events
@@ -41,8 +43,26 @@ rules:
 - apiGroups:
   - sharedfs.littlemex.github.io
   resources:
-  - sharedfilesystemclaims
-  - sharedfilesystems
+  - filesystemsharedirectories
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - sharedfs.littlemex.github.io
+  resources:
+  - filesystemsharedirectories/status
+  - filesystemshares/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - sharedfs.littlemex.github.io
+  resources:
+  - filesystemshares
   verbs:
   - get
   - list
@@ -52,16 +72,46 @@ rules:
 - apiGroups:
   - sharedfs.littlemex.github.io
   resources:
-  - sharedfilesystemclaims/finalizers
-  - sharedfilesystems/finalizers
+  - filesystemshares/finalizers
   verbs:
   - update
 - apiGroups:
-  - sharedfs.littlemex.github.io
+  - storage.k8s.io
   resources:
-  - sharedfilesystemclaims/status
-  - sharedfilesystems/status
+  - csidrivers
   verbs:
   - get
-  - patch
-  - update
+  - list
+  - watch
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - storageclasses
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: manager-role
+  namespace: system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch

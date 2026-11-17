@@ -26,10 +26,13 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -90,8 +93,12 @@ var _ = BeforeSuite(func() {
 	Expect(k8sClient).NotTo(BeNil())
 
 	By("starting the controllers")
+	Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: controllerNamespace}})).To(Succeed())
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:  scheme.Scheme,
+		Scheme: scheme.Scheme,
+		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
+			&corev1.Pod{}: {Namespaces: map[string]cache.Config{controllerNamespace: {}}},
+		}},
 		Metrics: metricsserver.Options{BindAddress: "0"},
 		Controller: config.Controller{
 			SkipNameValidation: ptr.To(true),
@@ -99,14 +106,18 @@ var _ = BeforeSuite(func() {
 	})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(SetupIndexes(ctx, mgr)).To(Succeed())
-	Expect((&SharedFilesystemReconciler{
-		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: mgr.GetEventRecorder("sharedfs"),
+	recorder := mgr.GetEventRecorder("sharedfs")
+	Expect((&ShareReconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: recorder,
 	}).SetupWithManager(mgr)).To(Succeed())
-	Expect((&SharedFilesystemClaimReconciler{
-		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorder("sharedfs"), RevocationGracePeriod: gracePeriod,
+	Expect((&ProvisionerReconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: recorder,
+		RevocationGracePeriod: gracePeriod,
 	}).SetupWithManager(mgr)).To(Succeed())
-	Expect((&OrphanReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()}).SetupWithManager(mgr)).To(Succeed())
+	Expect((&DirectoryReconciler{Client: mgr.GetClient(), Preparer: PreparerConfig{
+		Namespace: controllerNamespace, Image: preparerImage, ServiceAccount: "sharedfs-preparer",
+	}}).SetupWithManager(mgr)).To(Succeed())
+	Expect((&ReclaimReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()}).SetupWithManager(mgr)).To(Succeed())
 	go func() {
 		defer GinkgoRecover()
 		Expect(mgr.Start(ctx)).To(Succeed())

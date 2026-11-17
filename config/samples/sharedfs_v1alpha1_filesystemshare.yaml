@@ -1,0 +1,36 @@
+# Each team namespace labelled sharedfs.example/team gets its own directory teams/<namespace>,
+# created on first use with owner root:1000 and mode 2770. A team claims it with an ordinary
+# PersistentVolumeClaim of storageClassName team-scratch-rw.
+apiVersion: sharedfs.littlemex.github.io/v1alpha1
+kind: FilesystemShare
+metadata:
+  name: team-scratch
+spec:
+  persistentVolumeRef:
+    name: fsx-lustre
+  path: "teams/{namespace}"
+  provision:
+    gid: 1000
+    mode: "2770"
+  grants:
+  - namespaceSelector:
+      matchExpressions:
+      - key: sharedfs.example/team
+        operator: Exists
+    access: ReadWrite
+---
+# One read-only dataset directory for every team. Claim it with storageClassName datasets-ro.
+apiVersion: sharedfs.littlemex.github.io/v1alpha1
+kind: FilesystemShare
+metadata:
+  name: datasets
+spec:
+  persistentVolumeRef:
+    name: fsx-lustre
+  path: "datasets"
+  grants:
+  - namespaceSelector:
+      matchExpressions:
+      - key: sharedfs.example/team
+        operator: Exists
+    access: ReadOnly
