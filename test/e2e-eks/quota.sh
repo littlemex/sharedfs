@@ -11,7 +11,7 @@ set -uo pipefail
 SRC=${1:?source PV}; NODE=${2:?node}
 ID=$(LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 5)
 P=sfsq-$ID; KEY=sharedfs-quota-e2e/$P
-NS_ADMIN=$P-admin; NS_TEAM=$P-team; NS_OLD=$P-old
+NS_ADMIN=$P-admin; NS_TEAM=$P-team; NS_OLD=$P-old; NS_TAG=$P-tag
 G=sharedfs.littlemex.github.io
 PASS=0; FAIL=0
 ok() { PASS=$((PASS+1)); echo "[PASS] $*"; }
@@ -34,7 +34,7 @@ EOF
 cleanup() {
   echo; echo "== cleanup"
   kubectl -n "$NS_ADMIN" exec lfs -- rm -rf "/fs/$P" >/dev/null 2>&1
-  kubectl delete ns "$NS_ADMIN" "$NS_TEAM" "$NS_OLD" --wait=false >/dev/null 2>&1
+  kubectl delete ns "$NS_ADMIN" "$NS_TEAM" "$NS_OLD" "$NS_TAG" --wait=false >/dev/null 2>&1
   for s in $(kubectl get fss -o name | grep "/$P"); do kubectl delete "$s" --wait=false >/dev/null 2>&1; done
   wait_for 240 sh -c "! kubectl get fss -o name | grep -q /$P"
   echo "left over: shares $(kubectl get fss -o name | grep -c "/$P"), quota pods $(kubectl -n sharedfs-quota get pods -o name | wc -l | tr -d ' ')"
@@ -43,7 +43,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== setup on $SRC"
-for ns in "$NS_ADMIN" "$NS_TEAM" "$NS_OLD"; do kubectl create ns "$ns" >/dev/null; kubectl label ns "$ns" "$KEY=${ns##*-}" >/dev/null; done
+for ns in "$NS_ADMIN" "$NS_TEAM" "$NS_OLD" "$NS_TAG"; do kubectl create ns "$ns" >/dev/null; kubectl label ns "$ns" "$KEY=${ns##*-}" >/dev/null; done
 kubectl apply -f - >/dev/null <<EOF
 apiVersion: $G/v1alpha1
 kind: FilesystemShare
@@ -81,10 +81,11 @@ metadata: {name: $P-team}
 spec:
   persistentVolumeRef: {name: $SRC}
   path: "$P/{namespace}"
-  provision: {gid: 2000, mode: "2770", quota: {storage: 50Mi, inodes: 1000}}
+  provision: {uid: 1000, gid: 2000, mode: "2770", quota: {storage: 50Mi, inodes: 1000}}
   grants: [{namespaceSelector: {matchExpressions: [{key: $KEY, operator: In, values: [team, old]}]}, access: ReadWrite}]
 EOF
 check "quota share Ready" wait_for 60 sh -c "[ \"\$(kubectl get fss $P-team -o jsonpath='{.status.conditions[0].status}')\" = True ]"
+check "and it warns that the granted namespaces are not Pod Security restricted" sh -c "kubectl get fss $P-team -o jsonpath='{.status.conditions[0].message}' | grep -q 'not Pod Security restricted'"
 
 echo; echo "== 1. a new directory gets its own project and limit before the claim is Bound"
 T0=$(date +%s)
@@ -95,6 +96,7 @@ PID=$(kubectl get fsd "$(fsd_of "$NS_TEAM")" -o jsonpath='{.spec.projectID}')
 echo "project ID: $PID"
 check "Prepared/DirectoryCreated" cond_is "$NS_TEAM" Prepared True/DirectoryCreated
 check "QuotaApplied/QuotaApplied" cond_is "$NS_TEAM" QuotaApplied True/QuotaApplied
+check "the directory is 1000:2000 2770 (the quota pod opened a directory root does not own)" sh -c "[ \"\$(kubectl -n $NS_ADMIN exec lfs -- stat -c '%u:%g %a' /fs/$P/$NS_TEAM)\" = '1000:2000 2770' ]"
 check "the directory carries the project ID with inheritance" sh -c "kubectl -n $NS_ADMIN exec lfs -- lfs project -d /fs/$P/$NS_TEAM | grep -q \"^ *$PID P \""
 check "the project's limits are 51200 KiB and 1000 inodes" sh -c "kubectl -n $NS_ADMIN exec lfs -- lfs quota -p $PID /fs | awk 'NR==3{print \$4, \$8}' | grep -qx '51200 1000'"
 check "quota pod, claim and volume are gone" wait_for 60 sh -c "! kubectl -n sharedfs-quota get pod,pvc -o name | grep -q . && ! kubectl get pv -o name | grep -q sfs-quota-"
@@ -134,5 +136,24 @@ check "its record: QuotaApplied False/DirectoryNotTagged" wait_for 240 cond_is "
 check "its claim stays Pending" phase_is "$NS_OLD" work Pending
 check "the existing directory was not changed (root 0700, no project)" sh -c "[ \"\$(kubectl -n $NS_ADMIN exec lfs -- stat -c '%u %a' /fs/$P/$NS_OLD)\" = '0 700' ] && kubectl -n $NS_ADMIN exec lfs -- lfs project -d /fs/$P/$NS_OLD | grep -q '^ *0 - '"
 
-echo; echo "== 5. the controller logged no reconciler errors"
+echo; echo "== 5. a parent that carries a project with inheritance is reported, and nothing is left"
+sh_in "$NS_ADMIN" lfs "mkdir -m 0755 /fs/$P-tagged && lfs project -p 4444 -s /fs/$P-tagged"
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: $G/v1alpha1
+kind: FilesystemShare
+metadata: {name: $P-tagged}
+spec:
+  persistentVolumeRef: {name: $SRC}
+  path: "$P-tagged/{namespace}"
+  provision: {gid: 2000, mode: "2770", quota: {inodes: 1000}}
+  grants: [{namespaceSelector: {matchLabels: {$KEY: tag}}, access: ReadWrite}]
+YAML
+pvc "$NS_TAG" work "$P-tagged-rw"
+tagged_msg() { kubectl get fsd -o jsonpath="{.items[?(@.spec.path==\"$P-tagged/$NS_TAG\")].status.conditions[0].message}"; }
+tagged_reported() { tagged_msg | grep -q 'carries a project ID'; }
+check "its record says the parent carries a project" wait_for 240 tagged_reported
+check "no directory and no temporary directory were left" sh -c "[ -z \"\$(kubectl -n $NS_ADMIN exec lfs -- ls -A /fs/$P-tagged)\" ]"
+kubectl delete fss "$P-tagged" --wait=false >/dev/null; sh_in "$NS_ADMIN" lfs "rm -rf /fs/$P-tagged" >/dev/null 2>&1
+
+echo; echo "== 6. the controller logged no reconciler errors"
 check "no reconciler errors" sh -c "! kubectl -n sharedfs-system logs -l control-plane=controller-manager --since=1h --tail=-1 | grep -q 'Reconciler error'"
