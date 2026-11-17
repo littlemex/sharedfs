@@ -62,6 +62,8 @@ var shareChanged = predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
 		a.Status.ObservedGeneration != b.Status.ObservedGeneration
 }}
 
+const podSecurityEnforce = "pod-security.kubernetes.io/enforce"
+
 // ClassNames are the StorageClasses of a share.
 func ClassNames(share *sharedfsv1alpha1.FilesystemShare) sharedfsv1alpha1.StorageClassNames {
 	return sharedfsv1alpha1.StorageClassNames{ReadWrite: share.Name + "-rw", ReadOnly: share.Name + "-ro"}

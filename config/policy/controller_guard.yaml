@@ -137,8 +137,15 @@ spec:
       !has(object.spec.initContainers) && !has(object.spec.ephemeralContainers) &&
       has(object.spec.automountServiceAccountToken) && !object.spec.automountServiceAccountToken &&
       has(object.spec.volumes) && object.spec.volumes.size() == 1 &&
-      object.spec.volumes.all(v, has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == object.metadata.name)
-    message: "a task pod must be one container by digest, dropping all other capabilities, without privilege, host namespaces or a token, with RuntimeDefault seccomp, mounting only its own internal claim"
+      object.spec.volumes.all(v, has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == object.metadata.name) &&
+      !has(object.spec.securityContext.sysctls) &&
+      object.spec.containers.all(c, !has(c.command) && !has(c.env) && !has(c.envFrom) &&
+        has(c.args) && c.args.size() > 0 && c.args[0] in ['prepare-directory', 'set-quota'] &&
+        has(c.securityContext.readOnlyRootFilesystem) && c.securityContext.readOnlyRootFilesystem &&
+        (!has(c.securityContext.seccompProfile) || c.securityContext.seccompProfile.type == 'RuntimeDefault') &&
+        !has(c.securityContext.procMount) && !has(c.securityContext.appArmorProfile) &&
+        !has(c.securityContext.seLinuxOptions) && !has(c.securityContext.windowsOptions))
+    message: "a task pod must be one container by digest running the controller's binary (no command, a task argument, no environment), dropping all other capabilities, without privilege, host namespaces, sysctls or a token, read-only root, RuntimeDefault seccomp, mounting only its own internal claim"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

@@ -93,6 +93,10 @@ type FilesystemShareDirectoryStatus struct {
 	// quotaSetter is the history of quota pods.
 	// +optional
 	QuotaSetter TaskStatus `json:"quotaSetter,omitzero"`
+	// projectVerified records that the project was checked to count nothing but this directory
+	// before its first limit; it is never checked again.
+	// +optional
+	ProjectVerified bool `json:"projectVerified,omitempty"`
 	// quota is the limit last set, when the share asks for one.
 	// +optional
 	Quota *AppliedQuota `json:"quota,omitempty"`

@@ -49,6 +49,9 @@ type ProvisionerReconciler struct {
 	RevocationLimiter *rate.Limiter
 	// ProjectIDs hands out project IDs to directory records of shares with a quota.
 	ProjectIDs *ProjectIDs
+	// QuotaRequiresRestricted refuses read-write claims of shares with a quota from namespaces
+	// that do not enforce Pod Security restricted.
+	QuotaRequiresRestricted bool
 	// MaxConcurrentReconciles is how many claims are handled at once.
 	MaxConcurrentReconciles int
 }
@@ -120,6 +123,14 @@ func (r *ProvisionerReconciler) provision(ctx context.Context, pvc *corev1.Persi
 	if ok, err := grantFor(share, &ns, access); err != nil || !ok {
 		return r.pending(pvc, sharedfsv1alpha1.EventNotGranted, fmt.Sprintf(
 			"FilesystemShare %s grants namespace %s no %s access", share.Name, ns.Name, access))
+	}
+	if r.QuotaRequiresRestricted && access == sharedfsv1alpha1.AccessReadWrite && share.Spec.Provision != nil &&
+		share.Spec.Provision.Quota != nil && ns.Labels[podSecurityEnforce] != "restricted" {
+		// A root process can move files to another project (measured), so a quota holds only
+		// against non-root writers.
+		return r.pending(pvc, sharedfsv1alpha1.EventUnsupportedClaim, fmt.Sprintf(
+			"FilesystemShare %s has a quota, which holds only if pods cannot run as root: label namespace %s "+
+				"pod-security.kubernetes.io/enforce=restricted (or run the controller with --quota-requires-restricted=false where root squash is on)", share.Name, ns.Name))
 	}
 
 	var sourcePV corev1.PersistentVolume

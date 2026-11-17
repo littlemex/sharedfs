@@ -9,6 +9,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
@@ -143,11 +144,19 @@ func differs(p *sharedfsv1alpha1.Provision, res prepare.Result) string {
 	return d
 }
 
+// updateDirStatus patches a record's status with an optimistic lock: two reconcilers write its
+// conditions, and a merge patch replaces the whole list, so a stale write must fail and retry
+// rather than drop the other's condition.
 func updateDirStatus(ctx context.Context, c client.Client, dir, before *sharedfsv1alpha1.FilesystemShareDirectory) error {
 	if equality.Semantic.DeepEqual(&before.Status, &dir.Status) {
 		return nil
 	}
-	return c.Status().Patch(ctx, dir, client.MergeFrom(before))
+	err := c.Status().Patch(ctx, dir, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+	if apierrors.IsConflict(err) {
+		// The other writer's change is an event of its own, which reconciles this record again.
+		return nil
+	}
+	return err
 }
 
 func (r *DirectoryReconciler) updateStatus(ctx context.Context, dir, before *sharedfsv1alpha1.FilesystemShareDirectory) error {

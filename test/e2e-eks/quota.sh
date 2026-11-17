@@ -87,7 +87,16 @@ EOF
 check "quota share Ready" wait_for 60 sh -c "[ \"\$(kubectl get fss $P-team -o jsonpath='{.status.conditions[0].status}')\" = True ]"
 check "and it warns that the granted namespaces are not Pod Security restricted" sh -c "kubectl get fss $P-team -o jsonpath='{.status.conditions[0].message}' | grep -q 'not Pod Security restricted'"
 
-echo; echo "== 1. a new directory gets its own project and limit before the claim is Bound"
+echo; echo "== 1. a claim from a namespace that is not Pod Security restricted is refused"
+event_seen() { kubectl -n "$1" get events --field-selector "involvedObject.name=$2,reason=$3" -o name 2>/dev/null | grep -q .; }
+pvc "$NS_TEAM" early "$P-team-rw"
+check "refused with UnsupportedClaim" wait_for 60 event_seen "$NS_TEAM" early UnsupportedClaim
+check "and stays Pending" phase_is "$NS_TEAM" early Pending
+kubectl -n "$NS_TEAM" delete pvc early --wait=false >/dev/null
+for ns in "$NS_TEAM" "$NS_OLD" "$NS_TAG"; do kubectl label ns "$ns" pod-security.kubernetes.io/enforce=restricted >/dev/null; done
+check "the share no longer warns once the namespaces are restricted" wait_for 60 sh -c "! kubectl get fss $P-team -o jsonpath='{.status.conditions[0].message}' | grep -q 'not Pod Security restricted'"
+
+echo; echo "== 2. a new directory gets its own project and limit before the claim is Bound"
 T0=$(date +%s)
 pvc "$NS_TEAM" work "$P-team-rw"
 check "team claim Bound" wait_for 300 phase_is "$NS_TEAM" work Bound
@@ -101,7 +110,7 @@ check "the directory carries the project ID with inheritance" sh -c "kubectl -n 
 check "the project's limits are 51200 KiB and 1000 inodes" sh -c "kubectl -n $NS_ADMIN exec lfs -- lfs quota -p $PID /fs | awk 'NR==3{print \$4, \$8}' | grep -qx '51200 1000'"
 check "quota pod, claim and volume are gone" wait_for 60 sh -c "! kubectl -n sharedfs-quota get pod,pvc -o name | grep -q . && ! kubectl get pv -o name | grep -q sfs-quota-"
 
-echo; echo "== 2. the limit holds against the tenant"
+echo; echo "== 3. the limit holds against the tenant"
 kubectl apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
@@ -110,9 +119,13 @@ spec:
   nodeSelector: {kubernetes.io/hostname: $NODE}
   restartPolicy: Never
   terminationGracePeriodSeconds: 1
-  securityContext: {runAsUser: 1000, runAsGroup: 2000, supplementalGroups: [2000]}
+  securityContext: {runAsUser: 1000, runAsGroup: 2000, supplementalGroups: [2000], runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
   containers:
-  - {name: c, image: public.ecr.aws/docker/library/busybox:1.36, command: [sleep, "3600"], volumeMounts: [{name: v, mountPath: /shared}]}
+  - name: c
+    image: public.ecr.aws/docker/library/busybox:1.36
+    command: [sleep, "3600"]
+    securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+    volumeMounts: [{name: v, mountPath: /shared}]
   volumes: [{name: v, persistentVolumeClaim: {claimName: work}}]
 EOF
 check "team pod running" wait_for 180 running "$NS_TEAM" w
@@ -125,20 +138,28 @@ echo "written: $SIZE bytes for a 50 MiB limit"
 check "less than twice the limit was written" sh -c "[ $SIZE -lt $((100*1024*1024)) ]"
 check "a subdirectory made by the tenant inherits the project" sh -c "kubectl -n $NS_TEAM exec w -- mkdir /shared/sub && kubectl -n $NS_ADMIN exec lfs -- lfs project -d /fs/$P/$NS_TEAM/sub | grep -q \"^ *$PID P \""
 
-echo; echo "== 3. raising the limit applies to the same project"
+echo; echo "== 4. raising the limit applies to the same project"
 kubectl patch fss "$P-team" --type=merge -p '{"spec":{"provision":{"quota":{"storage":"150Mi"}}}}' >/dev/null
 check "QuotaApplied again" wait_for 240 sh -c "[ \"\$(kubectl get fsd $(fsd_of "$NS_TEAM") -o jsonpath='{.status.quota.storage}')\" = 150Mi ] && kubectl get fsd $(fsd_of "$NS_TEAM") -o jsonpath='{.status.conditions[?(@.type==\"QuotaApplied\")].status}' | grep -qx True"
 check "the limit is now 153600 KiB" sh -c "kubectl -n $NS_ADMIN exec lfs -- lfs quota -p $PID /fs | awk 'NR==3{print \$4}' | grep -qx 153600"
 check "and the tenant can write more" sh -c "kubectl -n $NS_TEAM exec w -- sh -c 'rm /shared/big; dd if=/dev/zero of=/shared/big bs=1M count=100' >/dev/null 2>&1"
 
-echo; echo "== 4. a directory that existed before is not tagged and not handed out"
+echo; echo "== 5. a directory that existed before is not tagged and not handed out"
 pvc "$NS_OLD" work "$P-team-rw"
 check "its record: Prepared/DirectoryExists" wait_for 240 cond_is "$NS_OLD" Prepared True/DirectoryExists
 check "its record: QuotaApplied False/DirectoryNotTagged" wait_for 240 cond_is "$NS_OLD" QuotaApplied False/DirectoryNotTagged
 check "its claim stays Pending" phase_is "$NS_OLD" work Pending
 check "the existing directory was not changed (root 0700, no project)" sh -c "[ \"\$(kubectl -n $NS_ADMIN exec lfs -- stat -c '%u %a' /fs/$P/$NS_OLD)\" = '0 700' ] && kubectl -n $NS_ADMIN exec lfs -- lfs project -d /fs/$P/$NS_OLD | grep -q '^ *0 - '"
 
-echo; echo "== 5. a parent that carries a project with inheritance is reported, and nothing is left"
+echo; echo "== 6. a directory an admin tags afterwards gets its limit on a retry"
+sh_in "$NS_ADMIN" lfs "echo data > /fs/$P/$NS_OLD/existing"
+OLDID=$(kubectl get fsd "$(fsd_of "$NS_OLD")" -o jsonpath='{.spec.projectID}')
+sh_in "$NS_ADMIN" lfs "lfs project -p $OLDID -r -s /fs/$P/$NS_OLD"
+# The record retries with backoff; deleting its failed quota history is not needed, but waiting is.
+check "after the admin tags it, QuotaApplied (its own files do not count as another directory's)" wait_for 600 cond_is "$NS_OLD" QuotaApplied True/QuotaApplied
+check "and its claim is Bound" wait_for 120 phase_is "$NS_OLD" work Bound
+
+echo; echo "== 7. a parent that carries a project with inheritance is reported, and nothing is left"
 sh_in "$NS_ADMIN" lfs "mkdir -m 0755 /fs/$P-tagged && lfs project -p 4444 -s /fs/$P-tagged"
 kubectl apply -f - >/dev/null <<YAML
 apiVersion: $G/v1alpha1
@@ -157,5 +178,5 @@ check "its record says the parent carries a project" wait_for 240 tagged_reporte
 check "no directory and no temporary directory were left" sh -c "[ -z \"\$(kubectl -n $NS_ADMIN exec lfs -- ls -A /fs/$P-tagged)\" ]"
 kubectl delete fss "$P-tagged" --wait=false >/dev/null; sh_in "$NS_ADMIN" lfs "rm -rf /fs/$P-tagged" >/dev/null 2>&1
 
-echo; echo "== 6. the controller logged no reconciler errors"
+echo; echo "== 8. the controller logged no reconciler errors"
 check "no reconciler errors" sh -c "! kubectl -n sharedfs-system logs -l control-plane=controller-manager --since=1h --tail=-1 | grep -q 'Reconciler error'"

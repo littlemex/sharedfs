@@ -216,7 +216,7 @@ func (r *ShareReconciler) quotaWarning(ctx context.Context, share *sharedfsv1alp
 	var names []string
 	for i := range list.Items {
 		ns := &list.Items[i]
-		if ok, _ := grantFor(share, ns, sharedfsv1alpha1.AccessReadWrite); ok && ns.Labels["pod-security.kubernetes.io/enforce"] != "restricted" {
+		if ok, _ := grantFor(share, ns, sharedfsv1alpha1.AccessReadWrite); ok && ns.Labels[podSecurityEnforce] != "restricted" {
 			names = append(names, ns.Name)
 		}
 	}

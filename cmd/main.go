@@ -88,6 +88,10 @@ func main() {
 	var quotaNamespace, quotaImage, quotaServiceAccount string
 	var projectIDBase int64
 	var quotaMaxPods int
+	var quotaRequiresRestricted bool
+	flag.BoolVar(&quotaRequiresRestricted, "quota-requires-restricted", true,
+		"Refuse read-write claims of shares with a quota from namespaces that do not enforce Pod Security restricted; "+
+			"turn off only where root squash keeps pods from writing as root.")
 	flag.IntVar(&quotaMaxPods, "quota-max-pods", 10, "Most quota pods running at once.")
 	flag.StringVar(&quotaNamespace, "quota-namespace", "",
 		"Namespace of quota pods, which need CAP_SYS_ADMIN; empty turns directory quotas off.")
@@ -244,6 +248,7 @@ func main() {
 			RevocationLimiter:       rate.NewLimiter(rate.Limit(revocationsPerMinute/60), max(int(revocationsPerMinute), 1)),
 			MaxConcurrentReconciles: concurrency,
 			ProjectIDs:              projectIDs,
+			QuotaRequiresRestricted: quotaRequiresRestricted,
 		},
 		"directory": &controller.DirectoryReconciler{Client: mgr.GetClient(), Preparer: preparer},
 		"reclaim":   &controller.ReclaimReconciler{Client: mgr.GetClient()},

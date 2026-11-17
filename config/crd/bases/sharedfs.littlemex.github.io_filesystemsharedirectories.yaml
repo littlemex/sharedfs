@@ -218,6 +218,11 @@ spec:
                       counted twice.
                     type: string
                 type: object
+              projectVerified:
+                description: |-
+                  projectVerified records that the project was checked to count nothing but this directory
+                  before its first limit; it is never checked again.
+                type: boolean
               quota:
                 description: quota is the limit last set, when the share asks for
                   one.

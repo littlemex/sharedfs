@@ -175,7 +175,13 @@ func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	if !sameLimits(dir.Status.Quota, want) && meta.IsStatusConditionTrue(dir.Status.Conditions, sharedfsv1alpha1.ConditionQuotaApplied) {
 		cond(false, sharedfsv1alpha1.ReasonQuotaPending, "the share's limits changed")
 	}
-	firstApply := dir.Status.Quota == nil
+	// Checked once, for a directory sharedfs created: an existing directory an admin tagged
+	// already holds its own files, and so does one whose quota was removed and set again.
+	created := false
+	if c := meta.FindStatusCondition(dir.Status.Conditions, sharedfsv1alpha1.ConditionPrepared); c != nil {
+		created = c.Reason == sharedfsv1alpha1.ReasonDirectoryCreated
+	}
+	firstApply := !dir.Status.ProjectVerified && created
 	res, state, err := t.run(ctx, &dir, isReady(&share), func() (string, *corev1.Pod, bool, error) {
 		// A change of limits on a large share would otherwise start a pod per directory at once.
 		var pods corev1.PodList
@@ -214,6 +220,7 @@ func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		case ok:
 			// What the pod read back, which may differ from the share if it changed meanwhile.
 			dir.Status.Quota = fromKiB(out.StorageKiB, out.Inodes)
+			dir.Status.ProjectVerified = true
 		}
 		cond(ok, out.Outcome, truncate(out.Message))
 		return ok

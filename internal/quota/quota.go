@@ -1,6 +1,7 @@
 // Package quota sets the Lustre project quota of one directory. It runs in the quota pod, which
-// mounts only that directory read-write and has only CAP_SYS_ADMIN, and calls lfs, which the
-// quota image carries. The directory must already carry its project ID: a directory sharedfs did
+// mounts only that directory read-write and has only CAP_SYS_ADMIN (for the quotactl) and
+// CAP_DAC_READ_SEARCH (to open the directory whatever its owner), and calls lfs, which the quota
+// image carries. The directory must already carry its project ID: a directory sharedfs did
 // not create is never tagged here, because tagging what is already in it would change files the
 // controller did not create.
 package quota
