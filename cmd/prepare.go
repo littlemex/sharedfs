@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -94,11 +95,22 @@ func preparerConfig(ctx context.Context, c client.Reader, image, sa, nodeSelecto
 		if name == "" {
 			return cfg, errors.New("set --preparer-image, or POD_NAME so the controller can read its own image")
 		}
+		// The kubelet reports the running image's digest shortly after the container starts.
 		var pod corev1.Pod
-		if err := c.Get(ctx, types.NamespacedName{Namespace: cfg.Namespace, Name: name}, &pod); err != nil {
-			return cfg, fmt.Errorf("reading own pod for the preparer image: %w", err)
+		for i := 0; ; i++ {
+			if err := c.Get(ctx, types.NamespacedName{Namespace: cfg.Namespace, Name: name}, &pod); err != nil {
+				return cfg, fmt.Errorf("reading own pod for the preparer image: %w", err)
+			}
+			cfg.Image = ownImage(&pod)
+			if strings.Contains(cfg.Image, "@sha256:") || i == 30 {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return cfg, ctx.Err()
+			case <-time.After(time.Second):
+			}
 		}
-		cfg.Image = ownImage(&pod)
 		if cfg.Image == "" {
 			return cfg, errors.New("own pod has no container named manager")
 		}
