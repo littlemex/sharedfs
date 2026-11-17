@@ -142,7 +142,14 @@ echo; echo "== 4. raising the limit applies to the same project"
 kubectl patch fss "$P-team" --type=merge -p '{"spec":{"provision":{"quota":{"storage":"150Mi"}}}}' >/dev/null
 check "QuotaApplied again" wait_for 240 sh -c "[ \"\$(kubectl get fsd $(fsd_of "$NS_TEAM") -o jsonpath='{.status.quota.storage}')\" = 150Mi ] && kubectl get fsd $(fsd_of "$NS_TEAM") -o jsonpath='{.status.conditions[?(@.type==\"QuotaApplied\")].status}' | grep -qx True"
 check "the limit is now 153600 KiB" sh -c "kubectl -n $NS_ADMIN exec lfs -- lfs quota -p $PID /fs | awk 'NR==3{print \$4}' | grep -qx 153600"
-check "and the tenant can write more" sh -c "kubectl -n $NS_TEAM exec w -- sh -c 'rm /shared/big; dd if=/dev/zero of=/shared/big bs=1M count=100' >/dev/null 2>&1"
+kubectl -n "$NS_TEAM" exec w -- rm /shared/big
+# Lustre releases the space of a deleted file from the quota asynchronously.
+used_kib() { kubectl -n "$NS_ADMIN" exec lfs -- lfs quota -p "$PID" /fs | awk 'NR==3{gsub(/\*/,"",$2); print $2}'; }
+released() { [ "$(used_kib)" -lt 10240 ]; }
+check "the deleted file's space is released from the quota" wait_for 120 released
+OUT=$(kubectl -n "$NS_TEAM" exec w -- dd if=/dev/zero of=/shared/big bs=1M count=100 2>&1); RC=$?
+echo "$OUT" | tail -1
+check "and the tenant can write 100 MiB under the 150 MiB limit" test "$RC" -eq 0
 
 echo; echo "== 5. a directory that existed before is not tagged and not handed out"
 pvc "$NS_OLD" work "$P-team-rw"
