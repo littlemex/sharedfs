@@ -2,8 +2,8 @@
 # since it depends on service name and namespace that are out of this kustomize package.
 # It should be run by config/default
 resources:
-- bases/sharedfs.littlemex.github.io_filesystemshares.yaml
-- bases/sharedfs.littlemex.github.io_filesystemsharedirectories.yaml
+- bases/sharedfs.io_filesystemshares.yaml
+- bases/sharedfs.io_filesystemsharedirectories.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

@@ -26,7 +26,7 @@ metadata:
 spec:
   podSelector:
     matchExpressions:
-    - {key: sharedfs.littlemex.github.io/internal, operator: Exists}
+    - {key: sharedfs.io/internal, operator: Exists}
   policyTypes: [Ingress, Egress]
 ---
 # The next Lustre project ID to hand out. The controller may read and update this ConfigMap and

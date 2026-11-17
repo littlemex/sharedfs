@@ -43,10 +43,10 @@ type DirectoryReconciler struct {
 	Preparer PreparerConfig
 }
 
-// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemsharedirectories,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=sharedfs.io,resources=filesystemsharedirectories,verbs=get;list;watch;patch
 // Owner references with blockOwnerDeletion need update on the owner's finalizers.
-// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemsharedirectories/finalizers,verbs=update
-// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemsharedirectories/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=sharedfs.io,resources=filesystemsharedirectories/finalizers,verbs=update
+// +kubebuilder:rbac:groups=sharedfs.io,resources=filesystemsharedirectories/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;create;delete
 // Pods and internal claims are created only in the controller's namespace.
 // +kubebuilder:rbac:groups="",namespace=system,resources=persistentvolumeclaims,verbs=create

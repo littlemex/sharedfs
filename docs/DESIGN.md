@@ -46,7 +46,7 @@ On EKS 1.35 with the FSx CSI drivers named below, FSx for Lustre file systems of
 
 ## API
 
-Group `sharedfs.littlemex.github.io`, version `v1alpha1`.
+Group `sharedfs.io`, version `v1alpha1`.
 
 **FilesystemShare** (cluster-scoped, created by the admin) is one path on one file system:
 

@@ -14,7 +14,7 @@ SRC=${1:?source PV}; NODE=${2:?node}
 ID=$(LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 5)
 P=sfsq-$ID; KEY=sharedfs-quota-e2e/$P
 NS_ADMIN=$P-admin; NS_TEAM=$P-team; NS_OLD=$P-old; NS_TAG=$P-tag
-G=sharedfs.littlemex.github.io
+G=sharedfs.io
 PASS=0; FAIL=0
 ok() { PASS=$((PASS+1)); echo "[PASS] $*"; }
 ng() { FAIL=$((FAIL+1)); echo "[FAIL] $*"; }

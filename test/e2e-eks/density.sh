@@ -9,7 +9,7 @@ set -uo pipefail
 SRC=${1:?source PV}; NODE=${2:?node}; N=${3:-50}
 ID=$(LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 5)
 P=sfsden-$ID; NS=$P
-G=sharedfs.littlemex.github.io
+G=sharedfs.io
 PASS=0; FAIL=0
 ok() { PASS=$((PASS+1)); echo "[PASS] $*"; }
 ng() { FAIL=$((FAIL+1)); echo "[FAIL] $*"; }
@@ -70,7 +70,7 @@ for i in $(seq "$N"); do kubectl -n "$NS" exec "p$i" -- ls /shared >/dev/null 2>
 check "every pod reads its mount ($READ/$N)" test "$READ" -eq "$N"
 T1=$(date +%s)
 kubectl -n "$NS" delete pods --all --wait=true >/dev/null
-share_pvs() { kubectl get pv -o 'custom-columns=S:.metadata.annotations.sharedfs\.littlemex\.github\.io/share-name' --no-headers | grep -cx "$P"; }
+share_pvs() { kubectl get pv -o 'custom-columns=S:.metadata.annotations.sharedfs\.io/share-name' --no-headers | grep -cx "$P"; }
 reclaimed() { [ "$(kubectl -n "$NS" get pvc --no-headers 2>/dev/null | wc -l | tr -d ' ')" -eq 0 ] && [ "$(share_pvs)" -eq 0 ]; }
 check "all claims and volumes go with the pods" wait_for 600 reclaimed
 echo "seconds to delete $N pods and reclaim their volumes: $(( $(date +%s) - T1 ))"

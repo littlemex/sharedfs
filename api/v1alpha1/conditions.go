@@ -86,7 +86,7 @@ const (
 // Names sharedfs puts on the objects it manages.
 const (
 	// Group is the API group, also the provisioner name of the StorageClasses.
-	Group = "sharedfs.littlemex.github.io"
+	Group = "sharedfs.io"
 	// ProvisionerName is the provisioner of the StorageClasses a FilesystemShare owns.
 	ProvisionerName = Group
 

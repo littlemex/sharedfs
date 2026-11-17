@@ -7,7 +7,7 @@ LLM training and inference on Kubernetes usually share one large file system: da
 sharedfs adds one cluster-scoped resource, **FilesystemShare**. An admin names an existing PersistentVolume, a path on it, and the namespaces allowed to mount it. sharedfs then provisions a PersistentVolume that mounts only that directory for every granted claim.
 
 ```yaml
-apiVersion: sharedfs.littlemex.github.io/v1alpha1
+apiVersion: sharedfs.io/v1alpha1
 kind: FilesystemShare
 metadata:
   name: checkpoints
@@ -24,7 +24,7 @@ spec:
       - {key: example.com/team, operator: Exists}
     access: ReadWrite
 ---
-apiVersion: sharedfs.littlemex.github.io/v1alpha1
+apiVersion: sharedfs.io/v1alpha1
 kind: FilesystemShare
 metadata:
   name: datasets
@@ -65,9 +65,9 @@ Pods write as a member of the directory's group: set `runAsGroup: 1000` or `supp
 | Only granted namespaces get a volume | A claim is provisioned only when a single grant of the share selects its namespace and allows the class's access. Otherwise it stays Pending with a `NotGranted` event |
 | Read-only is enforced at mount time | Read-only volumes carry the `ro` mount option. If the source mounts with `flock`, read-only volumes use `localflock` instead, so readers take no cluster-wide locks |
 | New mounts end when the grant ends | When a namespace loses its grant, a deadline (`--revocation-grace-period`, default 15 minutes) is written on the PersistentVolume, where tenants cannot edit it. If the grant is still missing at the deadline, sharedfs checks the live objects and then deletes the claim. Lowering a grant to ReadOnly withdraws read-write volumes too. Running pods keep their mount, and the claim stays Terminating, until they stop. A deleted claim is not recreated when the grant returns |
-| A mistake does not delete every claim | Deletions are rate-limited cluster-wide (`--revocations-per-minute`, default 30). The annotation `sharedfs.littlemex.github.io/pause-revocation: "true"` on a share holds all of its revocations. A share that was force-deleted, or recreated with a new UID, holds its claims instead of revoking them (`RevocationHeld` event) |
+| A mistake does not delete every claim | Deletions are rate-limited cluster-wide (`--revocations-per-minute`, default 30). The annotation `sharedfs.io/pause-revocation: "true"` on a share holds all of its revocations. A share that was force-deleted, or recreated with a new UID, holds its claims instead of revoking them (`RevocationHeld` event) |
 | A recreated namespace does not inherit a directory | For `{namespace}` paths, the namespace UID that first claimed the directory is recorded in a FilesystemShareDirectory. A later namespace with the same name gets `NamespaceRecreated` until an admin deletes the record |
-| Nested shares are checked | On one file system, when a share that grants ReadWrite may contain another share's directory, one of the two is not Ready (`OverlappingShare`) and gets no new volumes: the one that brought the conflict later, judged by when the outer share first granted ReadWrite and when the inner share was created. Existing volumes are never withdrawn by this check, so check the warning in a share's `Ready` message before adding ReadWrite to an outer share. Shares of the same directory are allowed (a read-write and a read-only share of one dataset), and paths that may coincide for some namespace only warn. The annotation `sharedfs.littlemex.github.io/allow-overlap: "true"` on the outer share exempts it, for an admin's own root share |
+| Nested shares are checked | On one file system, when a share that grants ReadWrite may contain another share's directory, one of the two is not Ready (`OverlappingShare`) and gets no new volumes: the one that brought the conflict later, judged by when the outer share first granted ReadWrite and when the inner share was created. Existing volumes are never withdrawn by this check, so check the warning in a share's `Ready` message before adding ReadWrite to an outer share. Shares of the same directory are allowed (a read-write and a read-only share of one dataset), and paths that may coincide for some namespace only warn. The annotation `sharedfs.io/allow-overlap: "true"` on the outer share exempts it, for an admin's own root share |
 | Deleting a volume never deletes data | Provisioned volumes are marked `provisioned-by` sharedfs, so neither the PV controller nor the driver's provisioner acts on them. When a claim goes, sharedfs deletes only the PersistentVolume object |
 | A share is not deleted under its tenants | Its finalizer waits until no provisioned volume remains, and its status names up to five of the claims |
 
@@ -189,7 +189,7 @@ To remove sharedfs, delete the claims, then the shares, then the controller (`ma
 - **Backup and restore.** Back up the FilesystemShares, FilesystemShareDirectories, the provisioned PersistentVolumes and the ConfigMap `sharedfs-project-ids` together, and restore with UIDs preserved where the tool allows. Records are named after the share's UID, so a share restored under a new UID starts with no records: its claims are held (`RevocationHeld`) instead of revoked, the namespace pinning of its directories is lost, and directories with a quota report `DirectoryNotTagged` until an admin tags them with their new project IDs. Namespaces restored under new UIDs report `NamespaceRecreated`. Keep `sharedfs-project-ids` at least as high as before, so no ID is handed out twice. Exclude these volumes from file-system backups of the PVC kind: every one of them is a directory of the same shared file system.
 - **A directory removed by hand.** A record stays Prepared, so mounts fail; delete the record, then create a new claim (records are made for Pending claims), and the directory is prepared again.
 - **Mutating webhooks** that inject sidecars or environment into pods must skip `sharedfs-system` and `sharedfs-quota`: the guard refuses task pods with anything added (`PreparerNotCreated`).
-- **Retry now.** After fixing a cause (for example tagging an existing directory), annotate its record with `sharedfs.littlemex.github.io/retry=now` to skip the backoff.
+- **Retry now.** After fixing a cause (for example tagging an existing directory), annotate its record with `sharedfs.io/retry=now` to skip the backoff.
 - **Metrics** are served on `:8443` by `config/default` (HTTPS, with authentication and authorization through the API server); give it a certificate for production (`--metrics-cert-path`).
 - **Quota pods pull with the node's credentials** (or a pull secret you add to the `sharedfs-quota` service account), not the controller's pull secrets.
 - **Not yet verified**: Bottlerocket and arm64 nodes, Karpenter cold starts for task pods, controller upgrade and rollback, Velero restores, more than 1,000 claims, Lustre 2.15 on PERSISTENT_2.

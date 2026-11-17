@@ -15,7 +15,7 @@ P=sfsscale-$ID; KEY=sharedfs-scale/$P
 CTRL_NS=${CTRL_NS:-sharedfs-system}; DEPLOY=sharedfs-controller-manager
 GRACE=${GRACE:-30}
 RATE=${RATE:-30}  # the controller's --revocations-per-minute
-G=sharedfs.littlemex.github.io
+G=sharedfs.io
 TOTAL=$((NNS*NPVC))
 PASS=0; FAIL=0
 ok() { PASS=$((PASS+1)); echo "[PASS] $*"; }
@@ -25,11 +25,11 @@ wait_for() { local t=$1; shift; for _ in $(seq "$t"); do "$@" >/dev/null 2>&1 &&
 # Predicates are plain functions called directly (never inside sh -c, where they do not exist).
 bound() { kubectl get pvc -A -l "$KEY" --no-headers 2>/dev/null | awk '$3=="Bound"' | wc -l | tr -d ' '; }
 count() { kubectl get pvc -A -l "$KEY" --no-headers 2>/dev/null | wc -l | tr -d ' '; }
-pvs() { kubectl get pv -o 'custom-columns=S:.metadata.annotations.sharedfs\.littlemex\.github\.io/share-name' --no-headers | grep -cx "$P"; }
-deadlines() { kubectl get pv -o 'custom-columns=S:.metadata.annotations.sharedfs\.littlemex\.github\.io/share-name,W:.metadata.annotations.sharedfs\.littlemex\.github\.io/withdraw-after' --no-headers | awk -v p="$P" '$1==p && $2!="<none>"' | wc -l | tr -d ' '; }
+pvs() { kubectl get pv -o 'custom-columns=S:.metadata.annotations.sharedfs\.io/share-name' --no-headers | grep -cx "$P"; }
+deadlines() { kubectl get pv -o 'custom-columns=S:.metadata.annotations.sharedfs\.io/share-name,W:.metadata.annotations.sharedfs\.io/withdraw-after' --no-headers | awk -v p="$P" '$1==p && $2!="<none>"' | wc -l | tr -d ' '; }
 at_least() { local v; v=$("$1"); [ "$v" -ge "$2" ] || { echo "  ($1=$v, want >= $2)" >&2; return 1; }; }
 exactly() { local v; v=$("$1"); [ "$v" -eq "$2" ] || { echo "  ($1=$v, want $2)" >&2; return 1; }; }
-leader() { kubectl -n "$CTRL_NS" get lease f5b32313.littlemex.github.io -o jsonpath='{.spec.holderIdentity}' | cut -d_ -f1; }
+leader() { kubectl -n "$CTRL_NS" get lease controller.sharedfs.io -o jsonpath='{.spec.holderIdentity}' | cut -d_ -f1; }
 restarts() { kubectl -n "$CTRL_NS" get pods -l control-plane=controller-manager -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount} {end}'; }
 
 cleanup() {

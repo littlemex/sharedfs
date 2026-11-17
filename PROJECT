@@ -3,7 +3,7 @@
 # and allow the plugins properly work.
 # More info: https://book.kubebuilder.io/reference/project-config.html
 cliVersion: 4.15.0
-domain: littlemex.github.io
+domain: io
 layout:
 - go.kubebuilder.io/v4
 projectName: sharedfs
@@ -12,7 +12,7 @@ resources:
 - api:
     crdVersion: v1
   controller: true
-  domain: littlemex.github.io
+  domain: io
   group: sharedfs
   kind: FilesystemShare
   path: github.com/littlemex/sharedfs/api/v1alpha1
@@ -20,7 +20,7 @@ resources:
 - api:
     crdVersion: v1
   controller: true
-  domain: littlemex.github.io
+  domain: io
   group: sharedfs
   kind: FilesystemShareDirectory
   path: github.com/littlemex/sharedfs/api/v1alpha1

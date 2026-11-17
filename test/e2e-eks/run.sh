@@ -19,7 +19,7 @@ NS_ADMIN=$P-admin; NS_TEAM=$P-team; NS_READER=$P-reader; NS_NONE=$P-none
 KEY=sharedfs-e2e/$P
 GRACE=${GRACE:-30}
 CTRL_NS=${CTRL_NS:-sharedfs-system}
-G=sharedfs.littlemex.github.io
+G=sharedfs.io
 PASS=0; FAIL=0
 
 ok()   { PASS=$((PASS+1)); echo "[PASS] $*"; }

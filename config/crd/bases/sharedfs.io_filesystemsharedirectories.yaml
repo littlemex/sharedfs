@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
-  name: filesystemsharedirectories.sharedfs.littlemex.github.io
+  name: filesystemsharedirectories.sharedfs.io
 spec:
-  group: sharedfs.littlemex.github.io
+  group: sharedfs.io
   names:
     categories:
     - sharedfs

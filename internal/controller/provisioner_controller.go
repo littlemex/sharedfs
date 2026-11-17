@@ -60,9 +60,9 @@ type ProvisionerReconciler struct {
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
-// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemshares,verbs=get;list;watch
-// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemsharedirectories,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemshares/finalizers,verbs=update
+// +kubebuilder:rbac:groups=sharedfs.io,resources=filesystemshares,verbs=get;list;watch
+// +kubebuilder:rbac:groups=sharedfs.io,resources=filesystemsharedirectories,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=sharedfs.io,resources=filesystemshares/finalizers,verbs=update
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 func (r *ProvisionerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

@@ -8,6 +8,6 @@ metadata:
     app.kubernetes.io/name: sharedfs
     app.kubernetes.io/managed-by: kustomize
 rules:
-- apiGroups: ["sharedfs.littlemex.github.io"]
+- apiGroups: ["sharedfs.io"]
   resources: ["filesystemshares"]
   verbs: ["get", "list", "watch"]

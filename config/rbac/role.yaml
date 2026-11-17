@@ -40,7 +40,7 @@ rules:
   - create
   - patch
 - apiGroups:
-  - sharedfs.littlemex.github.io
+  - sharedfs.io
   resources:
   - filesystemsharedirectories
   verbs:
@@ -50,14 +50,14 @@ rules:
   - patch
   - watch
 - apiGroups:
-  - sharedfs.littlemex.github.io
+  - sharedfs.io
   resources:
   - filesystemsharedirectories/finalizers
   - filesystemshares/finalizers
   verbs:
   - update
 - apiGroups:
-  - sharedfs.littlemex.github.io
+  - sharedfs.io
   resources:
   - filesystemsharedirectories/status
   - filesystemshares/status
@@ -66,7 +66,7 @@ rules:
   - patch
   - update
 - apiGroups:
-  - sharedfs.littlemex.github.io
+  - sharedfs.io
   resources:
   - filesystemshares
   verbs:

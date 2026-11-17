@@ -40,9 +40,9 @@ type ShareReconciler struct {
 	APIReader client.Reader
 }
 
-// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemshares,verbs=get;list;watch;patch
-// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemshares/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemshares/finalizers,verbs=update
+// +kubebuilder:rbac:groups=sharedfs.io,resources=filesystemshares,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=sharedfs.io,resources=filesystemshares/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=sharedfs.io,resources=filesystemshares/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=csidrivers,verbs=get;list;watch

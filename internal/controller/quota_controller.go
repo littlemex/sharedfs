@@ -108,7 +108,7 @@ type QuotaReconciler struct {
 	ProjectIDs *ProjectIDs
 }
 
-// +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemsharedirectories,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=sharedfs.io,resources=filesystemsharedirectories,verbs=get;list;watch;patch
 // Only the one ConfigMap it keeps project IDs in, which the install creates: the controller may
 // not touch any other, its guard's parameters included.
 // +kubebuilder:rbac:groups="",namespace=system,resources=configmaps,resourceNames=sharedfs-project-ids,verbs=get;update
