@@ -53,8 +53,8 @@ spec:
   podSelector: {}
   policyTypes: [Ingress, Egress]
 ---
-# The quota namespace is privileged, so nobody but the controller may run pods there, or exec,
-# attach or add ephemeral containers to them; the controller's own pods are further bound by
+# The quota namespace is privileged, so nobody but the controller may run pods there, change
+# their spec (the image included), or exec, attach or add ephemeral containers to them; the controller's own pods are further bound by
 # config/policy (controller-guard).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -80,7 +80,7 @@ spec:
     expression: "!has(request.subResource) || request.subResource == ''"
   validations:
   - expression: >-
-      variables.main && (request.operation == 'UPDATE' ||
+      variables.main && (request.operation == 'UPDATE' ? object.spec == oldObject.spec :
         request.userInfo.username == 'system:serviceaccount:sharedfs-system:sharedfs-controller-manager')
     message: "only the sharedfs controller runs pods in sharedfs-quota, and nobody execs into them"
 ---

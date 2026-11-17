@@ -11,7 +11,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -32,11 +31,10 @@ type QuotaConfig struct {
 	// Namespace of quota pods and their internal claims; empty turns quotas off.
 	Namespace string
 	// Image carries the controller binary and lfs.
-	Image            string
-	ServiceAccount   string
-	NodeSelector     map[string]string
-	Tolerations      []corev1.Toleration
-	ImagePullSecrets []corev1.LocalObjectReference
+	Image          string
+	ServiceAccount string
+	NodeSelector   map[string]string
+	Tolerations    []corev1.Toleration
 	// MaxPods bounds the quota pods running at once.
 	MaxPods int
 }
@@ -75,17 +73,14 @@ func (p *ProjectIDs) assign(ctx context.Context, write func(id int64) error) err
 	}
 	var cm corev1.ConfigMap
 	key := types.NamespacedName{Namespace: p.Namespace, Name: projectIDsConfigMap}
-	err := p.Reader.Get(ctx, key, &cm)
-	switch {
-	case apierrors.IsNotFound(err):
-		cm = corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: p.Namespace, Name: projectIDsConfigMap,
-			Labels: map[string]string{"app.kubernetes.io/name": "sharedfs"}}}
-	case err != nil:
-		return err
-	default:
-		if v, err := strconv.ParseInt(cm.Data[projectIDsKey], 10, 64); err == nil {
-			next = max(next, v)
+	if err := p.Reader.Get(ctx, key, &cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("ConfigMap %s/%s is missing: it is part of the install (config/manager)", p.Namespace, projectIDsConfigMap)
 		}
+		return err
+	}
+	if v, err := strconv.ParseInt(cm.Data[projectIDsKey], 10, 64); err == nil {
+		next = max(next, v)
 	}
 	if next > maxProjectID {
 		return fmt.Errorf("no project IDs left above %d", maxProjectID)
@@ -94,12 +89,7 @@ func (p *ProjectIDs) assign(ctx context.Context, write func(id int64) error) err
 		cm.Data = map[string]string{}
 	}
 	cm.Data[projectIDsKey] = strconv.FormatInt(next+1, 10)
-	if cm.ResourceVersion == "" {
-		err = p.Client.Create(ctx, &cm)
-	} else {
-		err = p.Client.Update(ctx, &cm)
-	}
-	if err != nil {
+	if err := p.Client.Update(ctx, &cm); err != nil {
 		return err
 	}
 	return write(next)
@@ -119,7 +109,9 @@ type QuotaReconciler struct {
 }
 
 // +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemsharedirectories,verbs=get;list;watch;patch
-// +kubebuilder:rbac:groups="",namespace=system,resources=configmaps,verbs=get;list;watch;create;update
+// Only the one ConfigMap it keeps project IDs in, which the install creates: the controller may
+// not touch any other, its guard's parameters included.
+// +kubebuilder:rbac:groups="",namespace=system,resources=configmaps,resourceNames=sharedfs-project-ids,verbs=get;update
 
 func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var dir sharedfsv1alpha1.FilesystemShareDirectory
@@ -140,7 +132,7 @@ func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		meta.RemoveStatusCondition(&dir.Status.Conditions, sharedfsv1alpha1.ConditionQuotaApplied)
 		dir.Status.Quota = nil
 		if err := updateDirStatus(ctx, r.Client, &dir, before); err != nil {
-			return ctrl.Result{}, err
+			return afterStatus(err, ctrl.Result{})
 		}
 		return ctrl.Result{}, r.cleanupIfConfigured(ctx, t)
 	}
@@ -167,7 +159,7 @@ func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	switch {
 	case r.Quota.Namespace == "" || r.Quota.Image == "":
 		cond(false, sharedfsv1alpha1.ReasonQuotaNotConfigured, "the controller runs without --quota-namespace and --quota-image")
-		return ctrl.Result{}, updateDirStatus(ctx, r.Client, &dir, before)
+		return afterStatus(updateDirStatus(ctx, r.Client, &dir, before), ctrl.Result{})
 	case sameLimits(dir.Status.Quota, want) &&
 		meta.IsStatusConditionTrue(dir.Status.Conditions, sharedfsv1alpha1.ConditionQuotaApplied):
 		return ctrl.Result{}, t.cleanup(ctx)
@@ -175,13 +167,14 @@ func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	if !sameLimits(dir.Status.Quota, want) && meta.IsStatusConditionTrue(dir.Status.Conditions, sharedfsv1alpha1.ConditionQuotaApplied) {
 		cond(false, sharedfsv1alpha1.ReasonQuotaPending, "the share's limits changed")
 	}
-	// Checked once, for a directory sharedfs created: an existing directory an admin tagged
-	// already holds its own files, and so does one whose quota was removed and set again.
+	// Checked once, for a directory the preparer created with this project ID: a directory an admin
+	// tagged (one that existed, or one created before the share had a quota) already holds its own
+	// files, and so does one whose quota was removed and set again.
 	created := false
 	if c := meta.FindStatusCondition(dir.Status.Conditions, sharedfsv1alpha1.ConditionPrepared); c != nil {
 		created = c.Reason == sharedfsv1alpha1.ReasonDirectoryCreated
 	}
-	firstApply := !dir.Status.ProjectVerified && created
+	firstApply := !dir.Status.ProjectVerified && created && dir.Status.Observed.ProjectID == dir.Spec.ProjectID
 	res, state, err := t.run(ctx, &dir, isReady(&share), func() (string, *corev1.Pod, bool, error) {
 		// A change of limits on a large share would otherwise start a pod per directory at once.
 		var pods corev1.PodList
@@ -202,7 +195,7 @@ func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			args = append(args, "--first-apply")
 		}
 		cfg := PreparerConfig{ServiceAccount: r.Quota.ServiceAccount, NodeSelector: r.Quota.NodeSelector,
-			Tolerations: r.Quota.Tolerations, ImagePullSecrets: r.Quota.ImagePullSecrets}
+			Tolerations: r.Quota.Tolerations}
 		// SYS_ADMIN for the quotactl, which Lustre allows only to it, and DAC_READ_SEARCH to open a
 		// directory whatever its owner and mode. The pod mounts the directory itself, read-write
 		// because Lustre refuses quotactl on a read-only mount, and has no token.
@@ -233,11 +226,11 @@ func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		cond(false, sharedfsv1alpha1.ReasonQuotaPending, fmt.Sprintf("quota pod %s/%s started", t.namespace, t.name))
 	case taskRecorded:
 		if err := updateDirStatus(ctx, r.Client, &dir, before); err != nil {
-			return ctrl.Result{}, err
+			return afterStatus(err, res)
 		}
 		return res, t.cleanup(ctx)
 	}
-	return res, updateDirStatus(ctx, r.Client, &dir, before)
+	return afterStatus(updateDirStatus(ctx, r.Client, &dir, before), res)
 }
 
 func (r *QuotaReconciler) task(dir *sharedfsv1alpha1.FilesystemShareDirectory) *task {

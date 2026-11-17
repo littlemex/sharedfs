@@ -87,7 +87,8 @@ func main() {
 	flag.IntVar(&burst, "kube-api-burst", 100, "Burst of queries to the API server.")
 	var quotaNamespace, quotaImage, quotaServiceAccount string
 	var projectIDBase int64
-	var quotaMaxPods int
+	var quotaMaxPods, preparerMaxPods int
+	flag.IntVar(&preparerMaxPods, "preparer-max-pods", 20, "Most preparer pods running at once.")
 	var quotaRequiresRestricted bool
 	flag.BoolVar(&quotaRequiresRestricted, "quota-requires-restricted", true,
 		"Refuse read-write claims of shares with a quota from namespaces that do not enforce Pod Security restricted; "+
@@ -232,6 +233,7 @@ func main() {
 		setupLog.Error(err, "Failed to set up field indexes")
 		os.Exit(1)
 	}
+	preparer.MaxPods = preparerMaxPods
 	recorder := mgr.GetEventRecorder("sharedfs")
 	projectIDs := &controller.ProjectIDs{Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Namespace: podNamespace, Base: projectIDBase}
 	if quotaNamespace != "" && !strings.Contains(quotaImage, "@sha256:") {
@@ -255,7 +257,7 @@ func main() {
 		"quota": &controller.QuotaReconciler{Client: mgr.GetClient(), ProjectIDs: projectIDs, Quota: controller.QuotaConfig{
 			Namespace: quotaNamespace, Image: quotaImage, ServiceAccount: quotaServiceAccount,
 			NodeSelector: preparer.NodeSelector, Tolerations: preparer.Tolerations,
-			ImagePullSecrets: preparer.ImagePullSecrets, MaxPods: quotaMaxPods,
+			MaxPods: quotaMaxPods,
 		}},
 	} {
 		if err := r.SetupWithManager(mgr); err != nil {

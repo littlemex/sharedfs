@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	sharedfsv1alpha1 "github.com/littlemex/sharedfs/api/v1alpha1"
+	"github.com/littlemex/sharedfs/internal/volume"
 )
 
 const (
@@ -63,6 +64,37 @@ var shareChanged = predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
 }}
 
 const podSecurityEnforce = "pod-security.kubernetes.io/enforce"
+
+// quotaOnFilesystem reports whether some share on the file system identified by fs has a quota.
+// A root process can move its own files to any project (measured), so a quota on one share is
+// only as safe as every read-write writer of the same file system.
+func quotaOnFilesystem(ctx context.Context, c client.Reader, fs string) (bool, error) {
+	var list sharedfsv1alpha1.FilesystemShareList
+	if err := c.List(ctx, &list); err != nil {
+		return false, err
+	}
+	for i := range list.Items {
+		s := &list.Items[i]
+		if s.Spec.Provision == nil || s.Spec.Provision.Quota == nil {
+			continue
+		}
+		var pv corev1.PersistentVolume
+		if err := c.Get(ctx, types.NamespacedName{Name: s.Spec.PersistentVolumeRef.Name}, &pv); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return false, err
+		}
+		src, err := volume.Resolve(&pv)
+		if err != nil {
+			continue
+		}
+		if f, _ := src.Identity(); f == fs {
+			return true, nil
+		}
+	}
+	return false, nil
+}
 
 // ClassNames are the StorageClasses of a share.
 func ClassNames(share *sharedfsv1alpha1.FilesystemShare) sharedfsv1alpha1.StorageClassNames {
@@ -168,4 +200,6 @@ type PreparerConfig struct {
 	Tolerations    []corev1.Toleration
 	// ImagePullSecrets are the controller pod's own, so the preparer pulls the same image.
 	ImagePullSecrets []corev1.LocalObjectReference
+	// MaxPods bounds the preparer pods running at once.
+	MaxPods int
 }

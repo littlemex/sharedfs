@@ -28,3 +28,14 @@ spec:
     matchExpressions:
     - {key: sharedfs.littlemex.github.io/internal, operator: Exists}
   policyTypes: [Ingress, Egress]
+---
+# The next Lustre project ID to hand out. The controller may read and update this ConfigMap and
+# no other; it must exist before the first share with a quota.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: project-ids
+  namespace: system
+  labels:
+    app.kubernetes.io/name: sharedfs
+data: {}

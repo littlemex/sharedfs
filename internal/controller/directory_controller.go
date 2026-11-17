@@ -75,6 +75,14 @@ func (r *DirectoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// directory that will have a quota waits for its project ID.
 	canStart := isReady(&share) && (p.Quota == nil || dir.Spec.ProjectID != 0)
 	res, state, err := t.run(ctx, &dir, canStart, func() (string, *corev1.Pod, bool, error) {
+		// Many namespaces claiming at once would otherwise start a pod each on a few nodes.
+		var pods corev1.PodList
+		if err := r.List(ctx, &pods, client.InNamespace(r.Preparer.Namespace), client.HasLabels{sharedfsv1alpha1.LabelInternal}); err != nil {
+			return "", nil, false, err
+		}
+		if len(pods.Items) >= max(r.Preparer.MaxPods, 1) {
+			return "", nil, true, nil
+		}
 		parent, leaf := sharepath.Parent(dir.Spec.Path)
 		args := []string{
 			"prepare-directory",
@@ -113,11 +121,11 @@ func (r *DirectoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			sharedfsv1alpha1.ReasonPreparing, fmt.Sprintf("preparer pod %s/%s started", t.namespace, t.name))
 	case taskRecorded:
 		if err := r.updateStatus(ctx, &dir, before); err != nil {
-			return ctrl.Result{}, err
+			return afterStatus(err, res)
 		}
 		return res, t.cleanup(ctx)
 	}
-	return res, r.updateStatus(ctx, &dir, before)
+	return afterStatus(r.updateStatus(ctx, &dir, before), res)
 }
 
 func (r *DirectoryReconciler) task(dir *sharedfsv1alpha1.FilesystemShareDirectory) *task {
@@ -151,12 +159,17 @@ func updateDirStatus(ctx context.Context, c client.Client, dir, before *sharedfs
 	if equality.Semantic.DeepEqual(&before.Status, &dir.Status) {
 		return nil
 	}
-	err := c.Status().Patch(ctx, dir, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+	return c.Status().Patch(ctx, dir, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+}
+
+// afterStatus turns a status write into a result: a conflict means the other writer changed the
+// record, whose event reconciles it again with nothing lost, because the task's pod is kept until
+// its outcome is recorded.
+func afterStatus(err error, res ctrl.Result) (ctrl.Result, error) {
 	if apierrors.IsConflict(err) {
-		// The other writer's change is an event of its own, which reconciles this record again.
-		return nil
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
-	return err
+	return res, err
 }
 
 func (r *DirectoryReconciler) updateStatus(ctx context.Context, dir, before *sharedfsv1alpha1.FilesystemShareDirectory) error {

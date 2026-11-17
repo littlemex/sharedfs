@@ -91,7 +91,8 @@ func sourcePV(name string) *corev1.PersistentVolume {
 func uniq(prefix string) string { return prefix + "-" + rand.String(6) }
 
 func namespace(granted string) *corev1.Namespace {
-	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: uniq("t"), Labels: map[string]string{}}}
+	// Restricted, as quota shares require of their writers; one test removes it.
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: uniq("t"), Labels: map[string]string{podSecurityEnforce: "restricted"}}}
 	if granted != "" {
 		ns.Labels[grantKey] = granted
 	}
@@ -712,6 +713,59 @@ var _ = Describe("Directories", func() {
 		more2 := claim(ns.Name, s.Name+"-rw")
 		create(more2)
 		provisioned(more2)
+	})
+
+	It("refuses read-write claims from non-restricted namespaces on a file system that has a quota", func() {
+		src := sourcePV(uniq("src"))
+		inodes := int64(1000)
+		q := share(uniq("q"), src.Name, "qq/{namespace}", grant("nr", sharedfsv1alpha1.AccessReadWrite))
+		q.Spec.Provision = &sharedfsv1alpha1.Provision{GID: 1, Mode: "2770", Quota: &sharedfsv1alpha1.Quota{Inodes: &inodes}}
+		plain := share(uniq("plain"), src.Name, "scratch", grant("nr", sharedfsv1alpha1.AccessReadWrite))
+		ns := namespace("nr")
+		delete(ns.Labels, podSecurityEnforce)
+		create(src, q, plain, ns)
+		readyShare(q)
+		readyShare(plain)
+		By("even through a share without a quota on the same file system")
+		pvc := claim(ns.Name, plain.Name+"-rw")
+		create(pvc)
+		neverProvisioned(pvc)
+		Eventually(eventReasons(pvc), timeout, interval).Should(ContainElement(sharedfsv1alpha1.EventUnsupportedClaim))
+		Eventually(func() string {
+			_ = k8sClient.Get(ctx, client.ObjectKeyFromObject(plain), plain)
+			return meta.FindStatusCondition(plain.Status.Conditions, sharedfsv1alpha1.ConditionReady).Message
+		}, timeout, interval).Should(ContainSubstring("not Pod Security restricted"))
+		By("labelling the namespace restricted lets it through")
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ns), ns)).To(Succeed())
+		ns.Labels[podSecurityEnforce] = "restricted"
+		Expect(k8sClient.Update(ctx, ns)).To(Succeed())
+		provisioned(pvc)
+	})
+
+	It("adds a quota to a directory created before the share had one, after the admin tags it", func() {
+		src := sourcePV(uniq("src"))
+		s := share(uniq("late"), src.Name, "late/{namespace}", grant("lt", sharedfsv1alpha1.AccessReadWrite))
+		s.Spec.Provision = &sharedfsv1alpha1.Provision{GID: 1000, Mode: "2770"}
+		ns := namespace("lt")
+		create(src, s, ns)
+		readyShare(s)
+		create(claim(ns.Name, s.Name+"-rw"))
+		dir, pod := preparer(DirectoryName(s.UID, ns.Name))
+		finish(pod, prepare.Result{Outcome: prepare.Created, GID: 1000, Mode: "2770"})
+		Eventually(func() bool {
+			_ = k8sClient.Get(ctx, client.ObjectKeyFromObject(dir), dir)
+			return meta.IsStatusConditionTrue(dir.Status.Conditions, sharedfsv1alpha1.ConditionPrepared)
+		}, timeout, interval).Should(BeTrue())
+		By("the share gets a quota; the record gets a project ID")
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(s), s)).To(Succeed())
+		inodes := int64(1000)
+		s.Spec.Provision.Quota = &sharedfsv1alpha1.Quota{Inodes: &inodes}
+		Expect(k8sClient.Update(ctx, s)).To(Succeed())
+		var qpod corev1.Pod
+		Eventually(func() error {
+			return k8sClient.Get(ctx, client.ObjectKey{Namespace: quotaNamespace, Name: volume.QuotaName(dir.UID)}, &qpod)
+		}, timeout, interval).Should(Succeed())
+		Expect(qpod.Spec.Containers[0].Args).NotTo(ContainElement("--first-apply"), "its own files must not count as another directory's")
 	})
 
 	It("records a pod that ended without a report and retries", func() {

@@ -124,13 +124,24 @@ func (r *ProvisionerReconciler) provision(ctx context.Context, pvc *corev1.Persi
 		return r.pending(pvc, sharedfsv1alpha1.EventNotGranted, fmt.Sprintf(
 			"FilesystemShare %s grants namespace %s no %s access", share.Name, ns.Name, access))
 	}
-	if r.QuotaRequiresRestricted && access == sharedfsv1alpha1.AccessReadWrite && share.Spec.Provision != nil &&
-		share.Spec.Provision.Quota != nil && ns.Labels[podSecurityEnforce] != "restricted" {
-		// A root process can move files to another project (measured), so a quota holds only
-		// against non-root writers.
-		return r.pending(pvc, sharedfsv1alpha1.EventUnsupportedClaim, fmt.Sprintf(
-			"FilesystemShare %s has a quota, which holds only if pods cannot run as root: label namespace %s "+
-				"pod-security.kubernetes.io/enforce=restricted (or run the controller with --quota-requires-restricted=false where root squash is on)", share.Name, ns.Name))
+	if r.QuotaRequiresRestricted && access == sharedfsv1alpha1.AccessReadWrite && ns.Labels[podSecurityEnforce] != "restricted" {
+		// A root process can move its files to any project (measured), into a quota's directory
+		// or out of it, so where any share of the file system has a quota, every read-write writer
+		// must be unable to run as root.
+		var sourcePV corev1.PersistentVolume
+		if err := r.Get(ctx, types.NamespacedName{Name: share.Spec.PersistentVolumeRef.Name}, &sourcePV); err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
+		}
+		if src, err := volume.Resolve(&sourcePV); err == nil {
+			fs, _ := src.Identity()
+			if quoted, err := quotaOnFilesystem(ctx, r.Client, fs); err != nil {
+				return ctrl.Result{}, err
+			} else if quoted {
+				return r.pending(pvc, sharedfsv1alpha1.EventUnsupportedClaim, fmt.Sprintf(
+					"shares of this file system have quotas, which hold only if no writer can run as root: label namespace %s "+
+						"pod-security.kubernetes.io/enforce=restricted (or run the controller with --quota-requires-restricted=false where root squash is on)", ns.Name))
+			}
+		}
 	}
 
 	var sourcePV corev1.PersistentVolume

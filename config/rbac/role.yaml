@@ -100,14 +100,13 @@ metadata:
 rules:
 - apiGroups:
   - ""
+  resourceNames:
+  - sharedfs-project-ids
   resources:
   - configmaps
   verbs:
-  - create
   - get
-  - list
   - update
-  - watch
 - apiGroups:
   - ""
   resources:

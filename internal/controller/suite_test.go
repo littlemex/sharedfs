@@ -95,6 +95,7 @@ var _ = BeforeSuite(func() {
 	By("starting the controllers")
 	Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: controllerNamespace}})).To(Succeed())
 	Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: quotaNamespace}})).To(Succeed())
+	Expect(k8sClient.Create(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "sharedfs-project-ids", Namespace: controllerNamespace}})).To(Succeed())
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme.Scheme,
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
@@ -112,10 +113,10 @@ var _ = BeforeSuite(func() {
 	Expect((&ShareReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()}).SetupWithManager(mgr)).To(Succeed())
 	Expect((&ProvisionerReconciler{
 		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: recorder,
-		RevocationGracePeriod: gracePeriod, ProjectIDs: projectIDs,
+		RevocationGracePeriod: gracePeriod, ProjectIDs: projectIDs, QuotaRequiresRestricted: true,
 	}).SetupWithManager(mgr)).To(Succeed())
 	Expect((&DirectoryReconciler{Client: mgr.GetClient(), Preparer: PreparerConfig{
-		Namespace: controllerNamespace, Image: preparerImage, ServiceAccount: "sharedfs-preparer",
+		Namespace: controllerNamespace, Image: preparerImage, ServiceAccount: "sharedfs-preparer", MaxPods: 20,
 	}}).SetupWithManager(mgr)).To(Succeed())
 	Expect((&ReclaimReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr)).To(Succeed())
 	Expect((&QuotaReconciler{Client: mgr.GetClient(), ProjectIDs: projectIDs, Quota: QuotaConfig{

@@ -181,7 +181,7 @@ func (r *ShareReconciler) check(ctx context.Context, share *sharedfsv1alpha1.Fil
 			}
 		}
 	}
-	if w, err := r.quotaWarning(ctx, share); err != nil {
+	if w, err := r.quotaWarning(ctx, share, src); err != nil {
 		return "", "", err
 	} else if w != "" {
 		warnings = append(warnings, w)
@@ -205,9 +205,13 @@ func (r *ShareReconciler) records(ctx context.Context, share *sharedfsv1alpha1.F
 // quotaWarning names the namespaces a share with a quota grants ReadWrite that do not enforce Pod
 // Security restricted: a root process there can move files to another project, out of the
 // quota or into another team's (measured), unless root squash is on.
-func (r *ShareReconciler) quotaWarning(ctx context.Context, share *sharedfsv1alpha1.FilesystemShare) (string, error) {
-	if share.Spec.Provision == nil || share.Spec.Provision.Quota == nil || !grantsReadWrite(share) {
+func (r *ShareReconciler) quotaWarning(ctx context.Context, share *sharedfsv1alpha1.FilesystemShare, src *volume.Source) (string, error) {
+	if !grantsReadWrite(share) {
 		return "", nil
+	}
+	fs, _ := src.Identity()
+	if quoted, err := quotaOnFilesystem(ctx, r.Client, fs); err != nil || !quoted {
+		return "", err
 	}
 	var list corev1.NamespaceList
 	if err := r.List(ctx, &list); err != nil {
@@ -226,7 +230,7 @@ func (r *ShareReconciler) quotaWarning(ctx context.Context, share *sharedfsv1alp
 	if len(names) > 5 {
 		names = append(names[:5], "...")
 	}
-	return fmt.Sprintf("namespaces %s are not Pod Security restricted: unless root squash is on, a root pod there can take files out of the quota",
+	return fmt.Sprintf("this file system has quotas and namespaces %s are not Pod Security restricted: unless root squash is on, a root pod there can move files into or out of any quota",
 		strings.Join(names, ", ")), nil
 }
 
