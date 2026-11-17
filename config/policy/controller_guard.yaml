@@ -34,17 +34,22 @@ spec:
     message: "the sharedfs controller may only create CSI volumes of the supported drivers named sfs-* with a sharedfs handle"
   - expression: >-
       request.kind.kind != 'Pod' ||
-      (object.metadata.namespace == 'sharedfs-system' && object.metadata.name.startsWith('sfs-prep-') &&
-       object.spec.containers.all(c, c.image.contains('@sha256:') &&
-         has(c.securityContext) && has(c.securityContext.privileged) == false) &&
-       object.spec.volumes.all(v, has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName.startsWith('sfs-prep-')))
-    message: "the sharedfs controller may only run preparer pods: pinned image, not privileged, only its internal claims"
+      (((object.metadata.namespace == 'sharedfs-system' && object.metadata.name.startsWith('sfs-prep-') &&
+         object.spec.containers.all(c, c.securityContext.capabilities.add.all(a, a == 'CHOWN'))) ||
+        (object.metadata.namespace == 'sharedfs-quota' && object.metadata.name.startsWith('sfs-quota-') &&
+         object.spec.containers.all(c, c.securityContext.capabilities.add.all(a, a == 'SYS_ADMIN')))) &&
+       object.spec.containers.all(c, c.image.contains('@sha256:') && !has(c.securityContext.privileged) &&
+         c.securityContext.capabilities.drop.exists(d, d == 'ALL')) &&
+       !has(object.spec.initContainers) && !has(object.spec.ephemeralContainers) &&
+       object.spec.automountServiceAccountToken == false &&
+       object.spec.volumes.all(v, has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == object.metadata.name))
+    message: "the sharedfs controller may only run its preparer and quota pods: pinned image, only CHOWN or only SYS_ADMIN, no token, only their own internal claim"
   - expression: >-
       request.kind.kind != 'PersistentVolume' || request.operation != 'DELETE' || oldObject.metadata.name.startsWith('sfs-')
     message: "the sharedfs controller may only delete its own volumes (sfs-*)"
   - expression: >-
       request.kind.kind != 'PersistentVolumeClaim' ||
-      oldObject.metadata.name.startsWith('sfs-prep-') ||
+      oldObject.metadata.name.startsWith('sfs-prep-') || oldObject.metadata.name.startsWith('sfs-quota-') ||
       (has(oldObject.spec.volumeName) && oldObject.spec.volumeName.startsWith('sfs-'))
     message: "the sharedfs controller may only delete claims bound to sharedfs volumes"
 ---

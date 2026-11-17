@@ -80,11 +80,29 @@ type Provision struct {
 	// +kubebuilder:default="2770"
 	// +kubebuilder:validation:Pattern=`^0?[02]?[0-7]{3}$`
 	Mode string `json:"mode"`
+
+	// quota limits each created directory with a Lustre project quota. The directory gets a
+	// project ID of its own when it is created, inherited by everything below it; the limits may
+	// change later. Needs Lustre 2.15 and the controller's quota pods (--quota-image).
+	// +optional
+	Quota *Quota `json:"quota,omitempty"`
+}
+
+// Quota is the hard limit of one directory.
+// +kubebuilder:validation:XValidation:rule="has(self.storage) || has(self.inodes)",message="set storage, inodes or both"
+type Quota struct {
+	// storage is the most data the directory may hold.
+	// +optional
+	Storage *resource.Quantity `json:"storage,omitempty"`
+	// inodes is the most files and directories it may hold.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Inodes *int64 `json:"inodes,omitempty"`
 }
 
 // FilesystemShareSpec offers one path of an existing file system to the namespaces its grants
 // select. The whole spec except grants is immutable.
-// +kubebuilder:validation:XValidation:rule="self.persistentVolumeRef == oldSelf.persistentVolumeRef && self.path == oldSelf.path && (has(self.provision) == has(oldSelf.provision)) && (!has(self.provision) || self.provision == oldSelf.provision)",message="only grants can change; create a new FilesystemShare instead"
+// +kubebuilder:validation:XValidation:rule="self.persistentVolumeRef == oldSelf.persistentVolumeRef && self.path == oldSelf.path && (has(self.provision) == has(oldSelf.provision)) && (!has(self.provision) || (self.provision.uid == oldSelf.provision.uid && self.provision.gid == oldSelf.provision.gid && self.provision.mode == oldSelf.provision.mode))",message="only grants and quota limits can change; create a new FilesystemShare instead"
 type FilesystemShareSpec struct {
 	// persistentVolumeRef names the existing static PersistentVolume of the file system. It is
 	// only read. It must be bound or reserved with claimRef, otherwise any namespace could bind

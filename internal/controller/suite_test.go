@@ -94,10 +94,11 @@ var _ = BeforeSuite(func() {
 
 	By("starting the controllers")
 	Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: controllerNamespace}})).To(Succeed())
+	Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: quotaNamespace}})).To(Succeed())
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme.Scheme,
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
-			&corev1.Pod{}: {Namespaces: map[string]cache.Config{controllerNamespace: {}}},
+			&corev1.Pod{}: {Namespaces: map[string]cache.Config{controllerNamespace: {}, quotaNamespace: {}}},
 		}},
 		Metrics: metricsserver.Options{BindAddress: "0"},
 		Controller: config.Controller{
@@ -107,15 +108,19 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(SetupIndexes(ctx, mgr)).To(Succeed())
 	recorder := mgr.GetEventRecorder("sharedfs")
+	projectIDs := &ProjectIDs{Reader: mgr.GetAPIReader(), Base: 1000000}
 	Expect((&ShareReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()}).SetupWithManager(mgr)).To(Succeed())
 	Expect((&ProvisionerReconciler{
 		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: recorder,
-		RevocationGracePeriod: gracePeriod,
+		RevocationGracePeriod: gracePeriod, ProjectIDs: projectIDs,
 	}).SetupWithManager(mgr)).To(Succeed())
 	Expect((&DirectoryReconciler{Client: mgr.GetClient(), Preparer: PreparerConfig{
 		Namespace: controllerNamespace, Image: preparerImage, ServiceAccount: "sharedfs-preparer",
 	}}).SetupWithManager(mgr)).To(Succeed())
 	Expect((&ReclaimReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr)).To(Succeed())
+	Expect((&QuotaReconciler{Client: mgr.GetClient(), ProjectIDs: projectIDs, Quota: QuotaConfig{
+		Namespace: quotaNamespace, Image: quotaImage, ServiceAccount: "sharedfs-quota",
+	}}).SetupWithManager(mgr)).To(Succeed())
 	go func() {
 		defer GinkgoRecover()
 		Expect(mgr.Start(ctx)).To(Succeed())

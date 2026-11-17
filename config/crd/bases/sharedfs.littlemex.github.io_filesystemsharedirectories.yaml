@@ -79,6 +79,14 @@ spec:
               path:
                 description: path is the expanded path inside the file system.
                 type: string
+              projectID:
+                description: |-
+                  projectID is the Lustre project ID given to the directory when it is created, unique among
+                  directory records; 0 for none. It can be set once, and never changes after.
+                format: int64
+                maximum: 4294967294
+                minimum: 0
+                type: integer
               shareRef:
                 description: ShareReference identifies a FilesystemShare by name and
                   UID.
@@ -102,14 +110,18 @@ spec:
             - shareRef
             type: object
             x-kubernetes-validations:
-            - message: spec is immutable
-              rule: self == oldSelf
+            - message: spec is immutable, except that a projectID can be set once
+              rule: self.shareRef == oldSelf.shareRef && self.__namespace__ == oldSelf.__namespace__
+                && self.namespaceUID == oldSelf.namespaceUID && self.path == oldSelf.path
+                && (!has(oldSelf.projectID) || (has(self.projectID) && self.projectID
+                == oldSelf.projectID))
           status:
             description: FilesystemShareDirectoryStatus is the observed state of the
               directory.
             properties:
               conditions:
-                description: 'conditions: Prepared.'
+                description: 'conditions: Prepared, and QuotaApplied for a share with
+                  a quota.'
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -168,22 +180,6 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
-              failures:
-                description: |-
-                  failures counts preparer runs that did not prepare the directory; retries back off
-                  from 30s, doubling, to one hour.
-                format: int32
-                type: integer
-              lastFailureTime:
-                description: lastFailureTime is when the latest failure was recorded;
-                  the next attempt waits from it.
-                format: date-time
-                type: string
-              lastPreparer:
-                description: |-
-                  lastPreparer is the UID of the latest preparer pod whose outcome was recorded, so one
-                  pod is never counted twice.
-                type: string
               observed:
                 description: ObservedDirectory is what the preparer found or created.
                 properties:
@@ -192,6 +188,11 @@ spec:
                     type: integer
                   mode:
                     type: string
+                  projectID:
+                    description: projectID is the directory's Lustre project ID, 0
+                      for none.
+                    format: int64
+                    type: integer
                   uid:
                     format: int64
                     type: integer
@@ -199,6 +200,54 @@ spec:
                 - gid
                 - mode
                 - uid
+                type: object
+              preparer:
+                description: preparer is the history of preparer pods.
+                properties:
+                  failures:
+                    description: failures counts runs that did not succeed.
+                    format: int32
+                    type: integer
+                  lastFailureTime:
+                    description: lastFailureTime is when the latest failure was recorded.
+                    format: date-time
+                    type: string
+                  lastPod:
+                    description: |-
+                      lastPod is the UID of the latest pod whose outcome was recorded, so one pod is never
+                      counted twice.
+                    type: string
+                type: object
+              quota:
+                description: quota is the limit last set, when the share asks for
+                  one.
+                properties:
+                  inodes:
+                    format: int64
+                    type: integer
+                  storage:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                type: object
+              quotaSetter:
+                description: quotaSetter is the history of quota pods.
+                properties:
+                  failures:
+                    description: failures counts runs that did not succeed.
+                    format: int32
+                    type: integer
+                  lastFailureTime:
+                    description: lastFailureTime is when the latest failure was recorded.
+                    format: date-time
+                    type: string
+                  lastPod:
+                    description: |-
+                      lastPod is the UID of the latest pod whose outcome was recorded, so one pod is never
+                      counted twice.
+                    type: string
                 type: object
             type: object
         required:

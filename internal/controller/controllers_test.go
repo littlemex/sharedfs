@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"slices"
 	"time"
 
@@ -33,7 +34,9 @@ const (
 	gracePeriod         = 3 * time.Second
 	grantKey            = "sharedfs-test/granted"
 	controllerNamespace = "sharedfs-system"
-	preparerImage       = "example.com/sharedfs:test"
+	preparerImage       = "example.com/sharedfs@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	quotaNamespace      = "sharedfs-quota"
+	quotaImage          = "example.com/sharedfs-quota@sha256:1111111111111111111111111111111111111111111111111111111111111111"
 	lustre              = "fsx.csi.aws.com"
 	openzfs             = "fsx.openzfs.csi.aws.com"
 )
@@ -578,7 +581,7 @@ var _ = Describe("Directories", func() {
 	finish := func(pod *corev1.Pod, res prepare.Result) {
 		pod.Status.Phase = corev1.PodSucceeded
 		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
-			Name: "prepare", Image: preparerImage, ImageID: preparerImage,
+			Name: "task", Image: preparerImage, ImageID: preparerImage,
 			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: res.JSON()}},
 		}}
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
@@ -633,6 +636,83 @@ var _ = Describe("Directories", func() {
 		gone(pod)
 	})
 
+	It("gives a directory of a share with a quota a project ID and sets its limits before provisioning", func() {
+		src := sourcePV(uniq("src"))
+		s := share(uniq("q"), src.Name, "teams/{namespace}", grant("qt", sharedfsv1alpha1.AccessReadWrite))
+		storage := resource.MustParse("10Gi")
+		inodes := int64(100000)
+		s.Spec.Provision = &sharedfsv1alpha1.Provision{GID: 1000, Mode: "2770",
+			Quota: &sharedfsv1alpha1.Quota{Storage: &storage, Inodes: &inodes}}
+		ns := namespace("qt")
+		create(src, s, ns)
+		readyShare(s)
+		pvc := claim(ns.Name, s.Name+"-rw")
+		create(pvc)
+
+		dir, pod := preparer(DirectoryName(s.UID, ns.Name))
+		Expect(dir.Spec.ProjectID).To(BeNumerically(">=", 1000000))
+		Expect(pod.Spec.Containers[0].Args).To(ContainElement(fmt.Sprintf("--project-id=%d", dir.Spec.ProjectID)))
+		finish(pod, prepare.Result{Outcome: prepare.Created, GID: 1000, Mode: "2770", ProjectID: uint32(dir.Spec.ProjectID)})
+
+		By("a quota pod with SYS_ADMIN only, mounting the directory itself, in the quota namespace")
+		var qpod corev1.Pod
+		Eventually(func() error {
+			return k8sClient.Get(ctx, client.ObjectKey{Namespace: quotaNamespace, Name: volume.QuotaName(dir.UID)}, &qpod)
+		}, timeout, interval).Should(Succeed())
+		ct := qpod.Spec.Containers[0]
+		Expect(ct.Image).To(Equal(quotaImage))
+		Expect(ct.SecurityContext.Capabilities.Add).To(Equal([]corev1.Capability{"SYS_ADMIN"}))
+		Expect(*qpod.Spec.AutomountServiceAccountToken).To(BeFalse())
+		Expect(ct.Args).To(Equal([]string{"set-quota", "--path=/target", fmt.Sprintf("--project-id=%d", dir.Spec.ProjectID),
+			"--storage-kib=10485760", "--inodes=100000"}))
+		var qpv corev1.PersistentVolume
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: volume.QuotaName(dir.UID)}, &qpv)).To(Succeed())
+		Expect(qpv.Spec.CSI.VolumeAttributes["mountname"]).To(Equal("abc/teams/" + ns.Name))
+		neverProvisioned(pvc)
+
+		finish(&qpod, prepare.Result{Outcome: sharedfsv1alpha1.ReasonQuotaApplied})
+		provisioned(pvc)
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(dir), dir)).To(Succeed())
+		Expect(dir.Status.Quota.Storage.Equal(storage)).To(BeTrue())
+
+		By("changing the limit runs the quota pod again, once the last run's claim and volume are gone")
+		gone(&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: quotaNamespace, Name: volume.QuotaName(dir.UID)}})
+		gone(&corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: volume.QuotaName(dir.UID)}})
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(s), s)).To(Succeed())
+		more := resource.MustParse("20Gi")
+		s.Spec.Provision.Quota.Storage = &more
+		Expect(k8sClient.Update(ctx, s)).To(Succeed())
+		Eventually(func(g Gomega) []string {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: quotaNamespace, Name: volume.QuotaName(dir.UID)}, &qpod)).To(Succeed())
+			g.Expect(qpod.DeletionTimestamp.IsZero()).To(BeTrue())
+			return qpod.Spec.Containers[0].Args
+		}, timeout, interval).Should(ContainElement("--storage-kib=20971520"))
+	})
+
+	It("does not hand out a directory whose quota cannot apply", func() {
+		src := sourcePV(uniq("src"))
+		s := share(uniq("q"), src.Name, "teams/{namespace}", grant("qn", sharedfsv1alpha1.AccessReadWrite))
+		inodes := int64(1000)
+		s.Spec.Provision = &sharedfsv1alpha1.Provision{GID: 1000, Mode: "2770", Quota: &sharedfsv1alpha1.Quota{Inodes: &inodes}}
+		ns := namespace("qn")
+		create(src, s, ns)
+		readyShare(s)
+		pvc := claim(ns.Name, s.Name+"-rw")
+		create(pvc)
+		dir, pod := preparer(DirectoryName(s.UID, ns.Name))
+		finish(pod, prepare.Result{Outcome: prepare.Exists, GID: 1000, Mode: "2770"})
+		var qpod corev1.Pod
+		Eventually(func() error {
+			return k8sClient.Get(ctx, client.ObjectKey{Namespace: quotaNamespace, Name: volume.QuotaName(dir.UID)}, &qpod)
+		}, timeout, interval).Should(Succeed())
+		finish(&qpod, prepare.Result{Outcome: sharedfsv1alpha1.ReasonDirectoryNotTagged, Message: "existed before"})
+		Eventually(func(g Gomega) *metav1.Condition {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(dir), dir)).To(Succeed())
+			return meta.FindStatusCondition(dir.Status.Conditions, sharedfsv1alpha1.ConditionQuotaApplied)
+		}, timeout, interval).Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonDirectoryNotTagged))
+		neverProvisioned(pvc)
+	})
+
 	It("records a failure, retries with backoff, and keeps the claim Pending", func() {
 		src := sourcePV(uniq("src"))
 		s := share(uniq("ck"), src.Name, "fail/{namespace}", grant("fail", sharedfsv1alpha1.AccessReadWrite))
@@ -648,11 +728,11 @@ var _ = Describe("Directories", func() {
 			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(dir), dir)).To(Succeed())
 			return meta.FindStatusCondition(dir.Status.Conditions, sharedfsv1alpha1.ConditionPrepared)
 		}, timeout, interval).Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonInsecureParent))
-		Expect(dir.Status.Failures).To(Equal(int32(1)))
-		Expect(dir.Status.LastPreparer).To(Equal(pod.UID))
+		Expect(dir.Status.Preparer.Failures).To(Equal(int32(1)))
+		Expect(dir.Status.Preparer.LastPod).To(Equal(pod.UID))
 		Consistently(func() int32 {
 			_ = k8sClient.Get(ctx, client.ObjectKeyFromObject(dir), dir)
-			return dir.Status.Failures
+			return dir.Status.Preparer.Failures
 		}, 3*time.Second, interval).Should(Equal(int32(1)), "one pod is counted once")
 		neverProvisioned(pvc)
 		Eventually(eventReasons(pvc), timeout, interval).Should(ContainElement(sharedfsv1alpha1.EventDirectoryNotReady))

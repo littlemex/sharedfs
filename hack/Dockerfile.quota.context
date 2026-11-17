@@ -1,0 +1,11 @@
+# Dockerfile.quota for builders that take a flat build context: this file plus src.tar.gz.
+FROM public.ecr.aws/docker/library/golang:1.26 AS builder
+WORKDIR /workspace
+ADD src.tar.gz /workspace/
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o manager ./cmd
+
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023
+RUN dnf install -y lustre-client && dnf clean all && rm -rf /var/cache/dnf
+COPY --from=builder /workspace/manager /manager
+ENTRYPOINT ["/manager"]

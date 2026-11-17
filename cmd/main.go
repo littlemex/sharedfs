@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strings"
 	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -61,6 +62,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == prepareCommand {
 		os.Exit(prepareDirectory(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == quotaCommand {
+		os.Exit(setQuota(os.Args[2:]))
+	}
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var enableLeaderElection bool
@@ -81,6 +85,16 @@ func main() {
 	var burst int
 	flag.Float64Var(&qps, "kube-api-qps", 50, "Queries per second to the API server.")
 	flag.IntVar(&burst, "kube-api-burst", 100, "Burst of queries to the API server.")
+	var quotaNamespace, quotaImage, quotaServiceAccount string
+	var projectIDBase int64
+	flag.StringVar(&quotaNamespace, "quota-namespace", "",
+		"Namespace of quota pods, which need CAP_SYS_ADMIN; empty turns directory quotas off.")
+	flag.StringVar(&quotaImage, "quota-image", "",
+		"Image of quota pods: this controller's binary and lfs, pinned by digest (Dockerfile.quota).")
+	flag.StringVar(&quotaServiceAccount, "quota-service-account", "sharedfs-quota",
+		"Service account of quota pods; it is bound to nothing and its token is not mounted.")
+	flag.Int64Var(&projectIDBase, "project-id-base", 1000000,
+		"First Lustre project ID given to directories; IDs below it are left to the admin.")
 	var preparerImage, preparerServiceAccount, preparerNodeSelector, preparerTolerations string
 	flag.StringVar(&preparerImage, "preparer-image", "",
 		"Image of preparer pods. Empty means this controller's own image, read from its pod.")
@@ -175,7 +189,7 @@ func main() {
 		Scheme: scheme,
 		Cache: cache.Options{
 			ByObject: map[client.Object]cache.ByObject{
-				&corev1.Pod{}: {Namespaces: map[string]cache.Config{podNamespace: {}}},
+				&corev1.Pod{}: {Namespaces: podNamespaces(podNamespace, quotaNamespace)},
 			},
 			// Claims and volumes of the whole cluster are cached; their managed fields are not needed.
 			DefaultTransform: cache.TransformStripManagedFields(),
@@ -213,6 +227,11 @@ func main() {
 		os.Exit(1)
 	}
 	recorder := mgr.GetEventRecorder("sharedfs")
+	projectIDs := &controller.ProjectIDs{Reader: mgr.GetAPIReader(), Base: projectIDBase}
+	if quotaNamespace != "" && !strings.Contains(quotaImage, "@sha256:") {
+		setupLog.Error(nil, "--quota-image must name an image by digest")
+		os.Exit(1)
+	}
 	for name, r := range map[string]interface{ SetupWithManager(ctrl.Manager) error }{
 		"filesystemshare": &controller.ShareReconciler{
 			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(),
@@ -222,9 +241,14 @@ func main() {
 			RevocationGracePeriod:   revocationGracePeriod,
 			RevocationLimiter:       rate.NewLimiter(rate.Limit(revocationsPerMinute/60), max(int(revocationsPerMinute), 1)),
 			MaxConcurrentReconciles: concurrency,
+			ProjectIDs:              projectIDs,
 		},
 		"directory": &controller.DirectoryReconciler{Client: mgr.GetClient(), Preparer: preparer},
 		"reclaim":   &controller.ReclaimReconciler{Client: mgr.GetClient()},
+		"quota": &controller.QuotaReconciler{Client: mgr.GetClient(), ProjectIDs: projectIDs, Quota: controller.QuotaConfig{
+			Namespace: quotaNamespace, Image: quotaImage, ServiceAccount: quotaServiceAccount,
+			NodeSelector: preparer.NodeSelector, Tolerations: preparer.Tolerations,
+		}},
 	} {
 		if err := r.SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", name)
@@ -247,4 +271,16 @@ func main() {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
+}
+
+// podNamespaces are the namespaces whose pods the controller reads: its own, for preparers, and
+// the quota namespace.
+func podNamespaces(namespaces ...string) map[string]cache.Config {
+	out := map[string]cache.Config{}
+	for _, n := range namespaces {
+		if n != "" {
+			out[n] = cache.Config{}
+		}
+	}
+	return out
 }

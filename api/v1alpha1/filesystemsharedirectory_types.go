@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -30,7 +31,7 @@ type ShareReference struct {
 
 // FilesystemShareDirectorySpec records which namespace a per-namespace directory belongs to. The
 // controller writes it when the namespace first claims the share; the whole spec is immutable.
-// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable"
+// +kubebuilder:validation:XValidation:rule="self.shareRef == oldSelf.shareRef && self.__namespace__ == oldSelf.__namespace__ && self.namespaceUID == oldSelf.namespaceUID && self.path == oldSelf.path && (!has(oldSelf.projectID) || (has(self.projectID) && self.projectID == oldSelf.projectID))",message="spec is immutable, except that a projectID can be set once"
 type FilesystemShareDirectorySpec struct {
 	ShareRef ShareReference `json:"shareRef"`
 	// namespace whose claims mount this directory.
@@ -41,6 +42,12 @@ type FilesystemShareDirectorySpec struct {
 	NamespaceUID types.UID `json:"namespaceUID"`
 	// path is the expanded path inside the file system.
 	Path string `json:"path"`
+	// projectID is the Lustre project ID given to the directory when it is created, unique among
+	// directory records; 0 for none. It can be set once, and never changes after.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=4294967294
+	ProjectID int64 `json:"projectID,omitempty"`
 }
 
 // ObservedDirectory is what the preparer found or created.
@@ -48,24 +55,48 @@ type ObservedDirectory struct {
 	UID  int64  `json:"uid"`
 	GID  int64  `json:"gid"`
 	Mode string `json:"mode"`
+	// projectID is the directory's Lustre project ID, 0 for none.
+	// +optional
+	ProjectID int64 `json:"projectID,omitempty"`
+}
+
+// TaskStatus is the history of the short-lived pods of one task. Retries back off from 30s,
+// doubling, to one hour, counted from the latest failure.
+type TaskStatus struct {
+	// failures counts runs that did not succeed.
+	// +optional
+	Failures int32 `json:"failures,omitempty"`
+	// lastFailureTime is when the latest failure was recorded.
+	// +optional
+	LastFailureTime *metav1.Time `json:"lastFailureTime,omitempty"`
+	// lastPod is the UID of the latest pod whose outcome was recorded, so one pod is never
+	// counted twice.
+	// +optional
+	LastPod types.UID `json:"lastPod,omitempty"`
+}
+
+// AppliedQuota is the limit last set on the directory's project.
+type AppliedQuota struct {
+	// +optional
+	Storage *resource.Quantity `json:"storage,omitempty"`
+	// +optional
+	Inodes *int64 `json:"inodes,omitempty"`
 }
 
 // FilesystemShareDirectoryStatus is the observed state of the directory.
 type FilesystemShareDirectoryStatus struct {
 	// +optional
 	Observed *ObservedDirectory `json:"observed,omitempty"`
-	// failures counts preparer runs that did not prepare the directory; retries back off
-	// from 30s, doubling, to one hour.
+	// preparer is the history of preparer pods.
 	// +optional
-	Failures int32 `json:"failures,omitempty"`
-	// lastFailureTime is when the latest failure was recorded; the next attempt waits from it.
+	Preparer TaskStatus `json:"preparer,omitzero"`
+	// quotaSetter is the history of quota pods.
 	// +optional
-	LastFailureTime *metav1.Time `json:"lastFailureTime,omitempty"`
-	// lastPreparer is the UID of the latest preparer pod whose outcome was recorded, so one
-	// pod is never counted twice.
+	QuotaSetter TaskStatus `json:"quotaSetter,omitzero"`
+	// quota is the limit last set, when the share asks for one.
 	// +optional
-	LastPreparer types.UID `json:"lastPreparer,omitempty"`
-	// conditions: Prepared.
+	Quota *AppliedQuota `json:"quota,omitempty"`
+	// conditions: Prepared, and QuotaApplied for a share with a quota.
 	// +listType=map
 	// +listMapKey=type
 	// +optional

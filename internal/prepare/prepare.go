@@ -55,6 +55,8 @@ type Request struct {
 	GID  int
 	// Mode is the octal permission string, for example "2770".
 	Mode string
+	// ProjectID, if not 0, is given to a created directory and inherited below it.
+	ProjectID uint32
 }
 
 // Result is reported back to the controller.
@@ -64,6 +66,8 @@ type Result struct {
 	UID     int64  `json:"uid,omitempty"`
 	GID     int64  `json:"gid,omitempty"`
 	Mode    string `json:"mode,omitempty"`
+	// ProjectID is the directory's project ID, 0 for none or unknown.
+	ProjectID uint32 `json:"projectID,omitempty"`
 }
 
 // JSON encodes a result; it never fails for this type.
@@ -127,7 +131,11 @@ func existing(parent int, name string) (Result, bool) {
 		if err := unix.Fstat(fd, &st); err != nil {
 			return fromErrno("checking the directory", err), true
 		}
-		return observed(Exists, &st, ""), true
+		res := observed(Exists, &st, "")
+		if id, _, err := ProjectOf(fd); err == nil {
+			res.ProjectID = id
+		}
+		return res, true
 	case errors.Is(err, unix.ENOENT):
 		return Result{}, false
 	case errors.Is(err, unix.ELOOP), errors.Is(err, unix.ENOTDIR):
@@ -165,6 +173,12 @@ func finish(parent int, tmp string, req Request, mode uint32) Result {
 	if err := unix.Fchown(fd, 0, 0); err != nil {
 		return fromErrno("setting the owner", err)
 	}
+	if req.ProjectID != 0 {
+		// While root owns it: setting a project ID needs the owner (or CAP_FOWNER).
+		if err := setProject(fd, req.ProjectID); err != nil {
+			return fromErrno("setting the project ID (does the file system support project quotas?)", err)
+		}
+	}
 	if err := unix.Fchmod(fd, mode); err != nil {
 		return fromErrno("setting the mode", err)
 	}
@@ -178,6 +192,14 @@ func finish(parent int, tmp string, req Request, mode uint32) Result {
 		return observed(Failed, &st, fmt.Sprintf("after chown the directory is %d:%d %04o, wanted %d:%d %04o",
 			st.Uid, st.Gid, uint32(st.Mode)&permMask, req.UID, req.GID, mode))
 	}
+	var projectID uint32
+	if req.ProjectID != 0 {
+		id, inherit, err := ProjectOf(fd)
+		if err != nil || id != req.ProjectID || !inherit {
+			return observed(Failed, &st, fmt.Sprintf("project ID is %d (inherit %t), wanted %d: %v", id, inherit, req.ProjectID, err))
+		}
+		projectID = id
+	}
 	if err := renameNoReplace(parent, tmp, req.Name); err != nil {
 		if errors.Is(err, unix.EEXIST) || errors.Is(err, unix.ENOTEMPTY) {
 			// Created by someone else meanwhile: report theirs, discard ours.
@@ -187,7 +209,9 @@ func finish(parent int, tmp string, req Request, mode uint32) Result {
 		}
 		return fromErrno("moving the directory into place", err)
 	}
-	return observed(Created, &st, "")
+	res := observed(Created, &st, "")
+	res.ProjectID = projectID
+	return res
 }
 
 // tempName is the temporary name of a directory being prepared. It is derived from the final name,

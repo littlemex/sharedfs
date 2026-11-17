@@ -198,6 +198,29 @@ spec:
                       setuid and sticky are not allowed.
                     pattern: ^0?[02]?[0-7]{3}$
                     type: string
+                  quota:
+                    description: |-
+                      quota limits each created directory with a Lustre project quota. The directory gets a
+                      project ID of its own when it is created, inherited by everything below it; the limits may
+                      change later. Needs Lustre 2.15 and the controller's quota pods (--quota-image).
+                    properties:
+                      inodes:
+                        description: inodes is the most files and directories it may
+                          hold.
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      storage:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: storage is the most data the directory may hold.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    type: object
+                    x-kubernetes-validations:
+                    - message: set storage, inodes or both
+                      rule: has(self.storage) || has(self.inodes)
                   uid:
                     default: 0
                     description: uid owns the created directory.
@@ -212,10 +235,13 @@ spec:
             - persistentVolumeRef
             type: object
             x-kubernetes-validations:
-            - message: only grants can change; create a new FilesystemShare instead
+            - message: only grants and quota limits can change; create a new FilesystemShare
+                instead
               rule: self.persistentVolumeRef == oldSelf.persistentVolumeRef && self.path
                 == oldSelf.path && (has(self.provision) == has(oldSelf.provision))
-                && (!has(self.provision) || self.provision == oldSelf.provision)
+                && (!has(self.provision) || (self.provision.uid == oldSelf.provision.uid
+                && self.provision.gid == oldSelf.provision.gid && self.provision.mode
+                == oldSelf.provision.mode))
           status:
             description: FilesystemShareStatus is the observed state of a FilesystemShare.
             properties:

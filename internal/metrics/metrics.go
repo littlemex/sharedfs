@@ -41,11 +41,11 @@ var (
 		Help: "Revocation steps by outcome.",
 	}, []string{"outcome"})
 
-	// PreparerOutcomes counts preparer results by Prepared reason.
-	PreparerOutcomes = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "sharedfs_preparer_outcomes_total",
-		Help: "Preparer pod results by reason.",
-	}, []string{"reason"})
+	// TaskOutcomes counts results of preparer and quota pods by reason.
+	TaskOutcomes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sharedfs_task_outcomes_total",
+		Help: "Preparer and quota pod results by task and reason.",
+	}, []string{"task", "reason"})
 
 	// Reclaimed counts Released volumes deleted.
 	Reclaimed = prometheus.NewCounter(prometheus.CounterOpts{
@@ -56,7 +56,7 @@ var (
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(ShareReady, ClaimsPending, Provisioned, ProvisionLatency,
-		Revocations, PreparerOutcomes, Reclaimed)
+		Revocations, TaskOutcomes, Reclaimed)
 }
 
 // SetShareReady records a share's current Ready status and reason, replacing the earlier one.

@@ -34,6 +34,7 @@ const (
 
 	pvNamePrefix       = "sfs-"
 	preparerNamePrefix = "sfs-prep-"
+	quotaNamePrefix    = "sfs-quota-"
 	handlePrefix       = "sharedfs:"
 )
 
@@ -42,12 +43,16 @@ func PVName(pvcUID types.UID) string { return pvNamePrefix + string(pvcUID) }
 
 // IsTenantPVName reports whether a volume name is one sharedfs gives a tenant's claim.
 func IsTenantPVName(name string) bool {
-	return strings.HasPrefix(name, pvNamePrefix) && !strings.HasPrefix(name, preparerNamePrefix)
+	return strings.HasPrefix(name, pvNamePrefix) && !strings.HasPrefix(name, preparerNamePrefix) && !strings.HasPrefix(name, quotaNamePrefix)
 }
 
 // PreparerName is the name of the internal PersistentVolume, claim and pod that prepare a
 // directory record.
 func PreparerName(dirUID types.UID) string { return preparerNamePrefix + string(dirUID) }
+
+// QuotaName is the name of the internal PersistentVolume, claim and pod that set a directory's
+// quota.
+func QuotaName(dirUID types.UID) string { return quotaNamePrefix + string(dirUID) }
 
 // IsGenerated reports whether an object was created by sharedfs.
 func IsGenerated(o metav1.Object) bool {
@@ -166,13 +171,14 @@ func PV(c Claim) *corev1.PersistentVolume {
 	}
 }
 
-// PreparerPV builds the internal PersistentVolume through which the preparer mounts the parent
-// of a directory it creates. It is read-write, reserved for the internal claim by UID, and
-// Retain: deleting it never asks anything of the driver.
-func PreparerPV(dir *sharedfsv1alpha1.FilesystemShareDirectory, src *Source, parent string, claim *corev1.PersistentVolumeClaim) *corev1.PersistentVolume {
+// InternalPV builds an internal PersistentVolume, named name, that mounts path read-write for one
+// task of a directory record (the preparer mounts the parent, the quota pod the directory). It is
+// reserved for the internal claim by UID, and Retain: deleting it never asks anything of the
+// driver.
+func InternalPV(name string, dir *sharedfsv1alpha1.FilesystemShareDirectory, src *Source, path string, claim *corev1.PersistentVolumeClaim) *corev1.PersistentVolume {
 	return &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   PreparerName(dir.UID),
+			Name:   name,
 			Labels: map[string]string{sharedfsv1alpha1.LabelInternal: string(dir.UID)},
 			Annotations: map[string]string{
 				AnnotationProvisionedBy: sharedfsv1alpha1.ProvisionerName,
@@ -192,24 +198,24 @@ func PreparerPV(dir *sharedfsv1alpha1.FilesystemShareDirectory, src *Source, par
 			},
 			PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{
 				Driver:           src.Profile.Name,
-				VolumeHandle:     handlePrefix + "prepare:" + string(dir.UID),
-				VolumeAttributes: Attributes(src, parent),
+				VolumeHandle:     handlePrefix + name,
+				VolumeAttributes: Attributes(src, path),
 			}},
 		},
 	}
 }
 
-// PreparerPVC builds the internal claim of a preparer.
-func PreparerPVC(dir *sharedfsv1alpha1.FilesystemShareDirectory, namespace string) *corev1.PersistentVolumeClaim {
+// InternalPVC builds the internal claim, named name, of a task in namespace.
+func InternalPVC(name string, dir *sharedfsv1alpha1.FilesystemShareDirectory, namespace string) *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: PreparerName(dir.UID), Namespace: namespace,
+			Name: name, Namespace: namespace,
 			Labels: map[string]string{sharedfsv1alpha1.LabelInternal: string(dir.UID)},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
 			StorageClassName: ptrTo(""),
-			VolumeName:       PreparerName(dir.UID),
+			VolumeName:       name,
 			VolumeMode:       ptrTo(corev1.PersistentVolumeFilesystem),
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},

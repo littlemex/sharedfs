@@ -47,6 +47,8 @@ type ProvisionerReconciler struct {
 	RevocationGracePeriod time.Duration
 	// RevocationLimiter bounds how fast claims are deleted across the whole cluster.
 	RevocationLimiter *rate.Limiter
+	// ProjectIDs hands out project IDs to directory records of shares with a quota.
+	ProjectIDs *ProjectIDs
 	// MaxConcurrentReconciles is how many claims are handled at once.
 	MaxConcurrentReconciles int
 }
@@ -192,7 +194,16 @@ func (r *ProvisionerReconciler) directory(ctx context.Context, pvc *corev1.Persi
 		if err := controllerutil.SetOwnerReference(share, &dir, r.Scheme()); err != nil {
 			return ctrl.Result{}, true, err
 		}
-		if err := r.Create(ctx, &dir); err != nil {
+		create := func(id int64) error {
+			dir.Spec.ProjectID = id
+			return r.Create(ctx, &dir)
+		}
+		if share.Spec.Provision != nil && share.Spec.Provision.Quota != nil {
+			err = r.ProjectIDs.assign(ctx, create)
+		} else {
+			err = create(0)
+		}
+		if err != nil {
 			if apierrors.IsAlreadyExists(err) {
 				// Created a moment ago: check it on the next pass.
 				return ctrl.Result{RequeueAfter: time.Second}, true, nil
@@ -225,6 +236,17 @@ func (r *ProvisionerReconciler) directory(ctx context.Context, pvc *corev1.Persi
 		}
 		res, err := r.pending(pvc, sharedfsv1alpha1.EventDirectoryNotReady, fmt.Sprintf("directory %s (%s) is not prepared: %s", expanded, name, msg))
 		return res, true, err
+	}
+	if share.Spec.Provision.Quota != nil {
+		// A directory of a share with a quota is handed out only once its limit holds.
+		if c := meta.FindStatusCondition(dir.Status.Conditions, sharedfsv1alpha1.ConditionQuotaApplied); c == nil || c.Status != metav1.ConditionTrue {
+			msg := sharedfsv1alpha1.ReasonQuotaPending
+			if c != nil {
+				msg = c.Reason
+			}
+			res, err := r.pending(pvc, sharedfsv1alpha1.EventDirectoryNotReady, fmt.Sprintf("the quota of directory %s (%s) is not applied: %s", expanded, name, msg))
+			return res, true, err
+		}
 	}
 	return ctrl.Result{}, false, nil
 }

@@ -22,6 +22,9 @@ const (
 	ConditionReady = "Ready"
 	// ConditionPrepared is set on a FilesystemShareDirectory: the directory exists as required.
 	ConditionPrepared = "Prepared"
+	// ConditionQuotaApplied is set on a FilesystemShareDirectory of a share with a quota: the
+	// directory's project has the share's limits.
+	ConditionQuotaApplied = "QuotaApplied"
 )
 
 // Reasons of FilesystemShare Ready.
@@ -54,6 +57,15 @@ const (
 	ReasonPermissionDenied   = "PermissionDenied"
 	ReasonPreparationFailed  = "PreparationFailed"
 	ReasonPreparerNotCreated = "PreparerNotCreated"
+)
+
+// Reasons of FilesystemShareDirectory QuotaApplied.
+const (
+	ReasonQuotaApplied       = "QuotaApplied"
+	ReasonQuotaPending       = "QuotaPending"
+	ReasonQuotaNotConfigured = "QuotaNotConfigured"
+	ReasonDirectoryNotTagged = "DirectoryNotTagged"
+	ReasonQuotaFailed        = "QuotaFailed"
 )
 
 // Event reasons on PersistentVolumeClaims.
