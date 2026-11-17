@@ -1,6 +1,6 @@
 # Builds the manager from a source tarball, for builders that take a flat build context
 # (for example a ConfigMap): the context is this file plus src.tar.gz.
-FROM public.ecr.aws/docker/library/golang:1.26 AS builder
+FROM public.ecr.aws/docker/library/golang:1.26@sha256:4165ee6bf3b7811fd7b40373290405c83d0167dcb87ee5f29c427cdcef45ff8f AS builder
 WORKDIR /workspace
 ADD src.tar.gz /workspace/
 RUN go mod download

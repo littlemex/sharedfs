@@ -87,6 +87,8 @@ func main() {
 	flag.IntVar(&burst, "kube-api-burst", 100, "Burst of queries to the API server.")
 	var quotaNamespace, quotaImage, quotaServiceAccount string
 	var projectIDBase int64
+	var quotaMaxPods int
+	flag.IntVar(&quotaMaxPods, "quota-max-pods", 10, "Most quota pods running at once.")
 	flag.StringVar(&quotaNamespace, "quota-namespace", "",
 		"Namespace of quota pods, which need CAP_SYS_ADMIN; empty turns directory quotas off.")
 	flag.StringVar(&quotaImage, "quota-image", "",
@@ -227,7 +229,7 @@ func main() {
 		os.Exit(1)
 	}
 	recorder := mgr.GetEventRecorder("sharedfs")
-	projectIDs := &controller.ProjectIDs{Reader: mgr.GetAPIReader(), Base: projectIDBase}
+	projectIDs := &controller.ProjectIDs{Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Namespace: podNamespace, Base: projectIDBase}
 	if quotaNamespace != "" && !strings.Contains(quotaImage, "@sha256:") {
 		setupLog.Error(nil, "--quota-image must name an image by digest")
 		os.Exit(1)
@@ -248,6 +250,7 @@ func main() {
 		"quota": &controller.QuotaReconciler{Client: mgr.GetClient(), ProjectIDs: projectIDs, Quota: controller.QuotaConfig{
 			Namespace: quotaNamespace, Image: quotaImage, ServiceAccount: quotaServiceAccount,
 			NodeSelector: preparer.NodeSelector, Tolerations: preparer.Tolerations,
+			ImagePullSecrets: preparer.ImagePullSecrets, MaxPods: quotaMaxPods,
 		}},
 	} {
 		if err := r.SetupWithManager(mgr); err != nil {

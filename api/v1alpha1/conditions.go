@@ -67,6 +67,7 @@ const (
 	ReasonQuotaNotConfigured = "QuotaNotConfigured"
 	ReasonDirectoryNotTagged = "DirectoryNotTagged"
 	ReasonQuotaFailed        = "QuotaFailed"
+	ReasonProjectInUse       = "ProjectInUse"
 )
 
 // Event reasons on PersistentVolumeClaims.

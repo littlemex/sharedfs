@@ -66,12 +66,14 @@ type Provision struct {
 	// +optional
 	// +kubebuilder:default=0
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=4294967294
 	UID int64 `json:"uid"`
 
 	// gid is the group of the created directory. Pods write through it, for example with
 	// runAsGroup or supplementalGroups.
 	// +required
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=4294967294
 	GID int64 `json:"gid"`
 
 	// mode of the created directory, octal; the setgid bit (2770) makes new files inherit gid.
@@ -90,6 +92,7 @@ type Provision struct {
 
 // Quota is the hard limit of one directory.
 // +kubebuilder:validation:XValidation:rule="has(self.storage) || has(self.inodes)",message="set storage, inodes or both"
+// +kubebuilder:validation:XValidation:rule="!has(self.storage) || quantity(self.storage).isGreaterThan(quantity('0'))",message="storage must be positive"
 type Quota struct {
 	// storage is the most data the directory may hold.
 	// +optional

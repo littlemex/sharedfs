@@ -19,6 +19,7 @@ import (
 
 	sharedfsv1alpha1 "github.com/littlemex/sharedfs/api/v1alpha1"
 	"github.com/littlemex/sharedfs/internal/prepare"
+	"github.com/littlemex/sharedfs/internal/quota"
 	"github.com/littlemex/sharedfs/internal/sharepath"
 	"github.com/littlemex/sharedfs/internal/volume"
 )
@@ -597,7 +598,7 @@ var _ = Describe("Provisioner", func() {
 var _ = Describe("Directories", func() {
 	BeforeEach(ensureDrivers)
 
-	finish := func(pod *corev1.Pod, res prepare.Result) {
+	finish := func(pod *corev1.Pod, res interface{ JSON() string }) {
 		pod.Status.Phase = corev1.PodSucceeded
 		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
 			Name: "task", Image: preparerImage, ImageID: preparerImage,
@@ -680,16 +681,16 @@ var _ = Describe("Directories", func() {
 		}, timeout, interval).Should(Succeed())
 		ct := qpod.Spec.Containers[0]
 		Expect(ct.Image).To(Equal(quotaImage))
-		Expect(ct.SecurityContext.Capabilities.Add).To(Equal([]corev1.Capability{"SYS_ADMIN"}))
+		Expect(ct.SecurityContext.Capabilities.Add).To(Equal([]corev1.Capability{"SYS_ADMIN", "DAC_READ_SEARCH"}))
 		Expect(*qpod.Spec.AutomountServiceAccountToken).To(BeFalse())
 		Expect(ct.Args).To(Equal([]string{"set-quota", "--path=/target", fmt.Sprintf("--project-id=%d", dir.Spec.ProjectID),
-			"--storage-kib=10485760", "--inodes=100000"}))
+			"--storage-kib=10485760", "--inodes=100000", "--first-apply"}))
 		var qpv corev1.PersistentVolume
 		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: volume.QuotaName(dir.UID)}, &qpv)).To(Succeed())
 		Expect(qpv.Spec.CSI.VolumeAttributes["mountname"]).To(Equal("abc/teams/" + ns.Name))
 		neverProvisioned(pvc)
 
-		finish(&qpod, prepare.Result{Outcome: sharedfsv1alpha1.ReasonQuotaApplied})
+		finish(&qpod, quota.Result{Outcome: quota.Applied, StorageKiB: 10485760, Inodes: 100000})
 		provisioned(pvc)
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(dir), dir)).To(Succeed())
 		Expect(dir.Status.Quota.Storage.Equal(storage)).To(BeTrue())
@@ -706,6 +707,49 @@ var _ = Describe("Directories", func() {
 			g.Expect(qpod.DeletionTimestamp.IsZero()).To(BeTrue())
 			return qpod.Spec.Containers[0].Args
 		}, timeout, interval).Should(ContainElement("--storage-kib=20971520"))
+		Expect(qpod.Spec.Containers[0].Args).NotTo(ContainElement("--first-apply"))
+		By("while the new limit is applied, claims keep being provisioned under the old one")
+		more2 := claim(ns.Name, s.Name+"-rw")
+		create(more2)
+		provisioned(more2)
+	})
+
+	It("records a pod that ended without a report and retries", func() {
+		src := sourcePV(uniq("src"))
+		s := share(uniq("ev"), src.Name, "ev/{namespace}", grant("ev", sharedfsv1alpha1.AccessReadWrite))
+		s.Spec.Provision = &sharedfsv1alpha1.Provision{GID: 1000, Mode: "2770"}
+		ns := namespace("ev")
+		create(src, s, ns)
+		readyShare(s)
+		create(claim(ns.Name, s.Name+"-rw"))
+		dir, pod := preparer(DirectoryName(s.UID, ns.Name))
+		pod.Status.Phase = corev1.PodFailed
+		pod.Status.Reason = "Evicted"
+		pod.Status.Message = "The node was low on resource: memory."
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		Eventually(func(g Gomega) *metav1.Condition {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(dir), dir)).To(Succeed())
+			return meta.FindStatusCondition(dir.Status.Conditions, sharedfsv1alpha1.ConditionPrepared)
+		}, timeout, interval).Should(haveCondition(metav1.ConditionFalse, sharedfsv1alpha1.ReasonPreparationFailed))
+		Expect(dir.Status.Preparer.Failures).To(Equal(int32(1)))
+		Expect(meta.FindStatusCondition(dir.Status.Conditions, sharedfsv1alpha1.ConditionPrepared).Message).To(ContainSubstring("Evicted"))
+	})
+
+	It("never hands out a project ID twice, even after its record is deleted", func() {
+		src := sourcePV(uniq("src"))
+		s := share(uniq("pid"), src.Name, "pid/{namespace}", grant("pid", sharedfsv1alpha1.AccessReadWrite))
+		inodes := int64(1000)
+		s.Spec.Provision = &sharedfsv1alpha1.Provision{GID: 1000, Mode: "2770", Quota: &sharedfsv1alpha1.Quota{Inodes: &inodes}}
+		a, b := namespace("pid"), namespace("pid")
+		create(src, s, a, b)
+		readyShare(s)
+		create(claim(a.Name, s.Name+"-rw"))
+		first, _ := preparer(DirectoryName(s.UID, a.Name))
+		Expect(k8sClient.Delete(ctx, first)).To(Succeed())
+		gone(first)
+		create(claim(b.Name, s.Name+"-rw"))
+		second, _ := preparer(DirectoryName(s.UID, b.Name))
+		Expect(second.Spec.ProjectID).To(BeNumerically(">", first.Spec.ProjectID))
 	})
 
 	It("does not hand out a directory whose quota cannot apply", func() {
@@ -724,7 +768,7 @@ var _ = Describe("Directories", func() {
 		Eventually(func() error {
 			return k8sClient.Get(ctx, client.ObjectKey{Namespace: quotaNamespace, Name: volume.QuotaName(dir.UID)}, &qpod)
 		}, timeout, interval).Should(Succeed())
-		finish(&qpod, prepare.Result{Outcome: sharedfsv1alpha1.ReasonDirectoryNotTagged, Message: "existed before"})
+		finish(&qpod, quota.Result{Outcome: quota.NotTagged, Message: "existed before"})
 		Eventually(func(g Gomega) *metav1.Condition {
 			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(dir), dir)).To(Succeed())
 			return meta.FindStatusCondition(dir.Status.Conditions, sharedfsv1alpha1.ConditionQuotaApplied)

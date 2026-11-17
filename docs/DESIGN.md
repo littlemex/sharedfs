@@ -15,7 +15,7 @@ The FSx for Lustre CSI driver provisions a new file system per claim. A static P
 
 ## Measured
 
-On EKS 1.35 with the FSx CSI drivers named below, an FSx for Lustre file system of Lustre version 2.12 and an FSx for OpenZFS file system, on CPU nodes. Gaps in the numbering are observations of an earlier design that no longer apply.
+On EKS 1.35 with the FSx CSI drivers named below, FSx for Lustre file systems of Lustre 2.12 (PERSISTENT_2) and 2.15 (SCRATCH_2) and an FSx for OpenZFS file system, on Amazon Linux 2023 CPU and GPU nodes. Gaps in the numbering are observations of an earlier design that no longer apply.
 
 | # | Observation | How |
 |---|---|---|
@@ -38,6 +38,8 @@ On EKS 1.35 with the FSx CSI drivers named below, an FSx for Lustre file system 
 | M21 | On Lustre 2.15, a directory's project ID with inheritance can be set by its owner with `CAP_CHOWN` only; a non-root owner cannot change it; `lfs setquota -p` needs `CAP_SYS_ADMIN` and a read-write mount (`Read-only file system` otherwise), and a directory mount is enough | probe pods with the bounding set narrowed by `setpriv` |
 | M22 | A 50 MiB project limit stops a tenant's write at 53 MiB with `Disk quota exceeded`; raising it applies to the same project | `test/e2e-eks/quota.sh` |
 | M23 | 1,000 claims in 40 namespaces are all Bound 259 s after they are created, with the leader killed at 111; exactly one volume per claim. The leader's memory is about 45 MiB with 800 PersistentVolumes and claims cached | `test/e2e-eks/scale.sh`, kubelet stats |
+| M24 | On Lustre 2.15, a root process in a tenant pod at Pod Security baseline changes the project ID of files and directories it does not own, also with `CAP_FOWNER` dropped; a non-root owner is refused | probe pods |
+| M25 | Renaming a directory with its own project ID into a parent that carries a project ID with inheritance fails with `EXDEV` | the preparer on a tagged parent |
 
 ## API
 
@@ -50,14 +52,14 @@ Group `sharedfs.littlemex.github.io`, version `v1alpha1`.
 | `spec.persistentVolumeRef` | The existing PersistentVolume of the file system. It must be bound or reserved |
 | `spec.path` | `"/"`, or relative segments of `[A-Za-z0-9._-]` (not starting with `.` or `-`), or `{namespace}` as a whole segment. At most 32 segments of 255 bytes, 1024 bytes in all |
 | `spec.grants[]` | `{namespaceSelector, access}`. A claim needs one grant that selects its namespace and allows the access of its class. Selectors must not be empty |
-| `spec.provision` | Optional `{uid, gid, mode}`: create the directory on first use |
+| `spec.provision` | Optional `{uid, gid, mode, quota}`: create the directory on first use, and limit it with a project quota (`quota: {storage, inodes}`, the only part that may change) |
 | `status.storageClasses` | `<name>-rw` and `<name>-ro`, owned by the share |
 | `status.volumes` | Provisioned volumes |
 | `status.readWriteSince` | When a ReadWrite grant was first seen, for the overlap order |
 
 Everything but the grants is immutable (CEL), so a share's path and source reference never change under the volumes it has provisioned. To change a path, create another share. `provision` requires a path other than `"/"`.
 
-**FilesystemShareDirectory** (cluster-scoped, created by the controller) records one directory of a share: which share (name and UID), which namespace and namespace UID, which expanded path, and, with `provision`, whether it is Prepared. Its spec is immutable. An admin deletes it to let a recreated namespace take the directory.
+**FilesystemShareDirectory** (cluster-scoped, created by the controller) records one directory of a share: which share (name and UID), which namespace and namespace UID, which expanded path, its project ID for a share with a quota, and, with `provision`, whether it is Prepared and whether its limit holds. Its spec is immutable. An admin deletes it to let a recreated namespace take the directory.
 
 The path rules are implemented twice, in CEL for admission and in Go (`internal/sharepath`) for the controller and the preparer. One list of examples (`ValidExamples` and `InvalidExamples` in `internal/sharepath/examples.go`) is run against both.
 
@@ -92,7 +94,7 @@ Each field has one writer. The PV controller does the binding: a provisioned vol
 | Revocation deadline on the PersistentVolume | on the claim | Tenants can edit their claims; only admins can edit PersistentVolumes |
 | Revocation guard rails: 15-minute default grace, a cluster-wide rate limit, a pause annotation, and holding (not revoking) when the share is gone or was recreated | a 30-second grace; revoke on any missing grant | A deleted claim is not recreated when the grant returns, so a mistaken label change must be undoable. The finalizer keeps a share while it has volumes, so a missing or replaced share means someone forced it, and judging all its claims ungranted would delete them all |
 | Quotas: the preparer tags a new directory with a project ID; a separate quota pod with only `CAP_SYS_ADMIN` sets the limit; existing directories are never tagged | give the preparer `CAP_SYS_ADMIN`; tag existing directories recursively | Tagging needs only ownership (M21), so the preparer keeps `CAP_CHOWN` alone. Setting limits needs `CAP_SYS_ADMIN`, which baseline forbids, so it runs in its own namespace and mounts only the directory it limits. Retagging an existing tree changes files sharedfs did not create |
-| Project IDs allocated by the leader from the records, under a lock | a hash of the path | Hashes collide; allocation from the records is exact and survives restarts because the ID is in the record's spec |
+| Project IDs from a high-water mark in a ConfigMap, raised before a record takes an ID, under a lock in the leader | the highest ID among the records; a hash of the path | Deleting a record must not free its ID while the directory still carries it (measured: the highest-record rule handed the same ID out again). Hashes collide. A first-apply check refuses a project that already counts files, for a range another cluster also uses |
 | An admission policy on the controller's own requests | trust the ClusterRole | The ClusterRole needs PersistentVolume create and claim delete cluster-wide; the policy narrows them to the controller's own objects |
 | A share that is not Ready stops new claims only | withdraw existing volumes | A source that is briefly unreadable must not take every tenant's volume away. Only a removed grant withdraws |
 | Directory records as a cluster-scoped kind | a list in the share's status | A record is a decision an admin may need to revoke, and deleting an object is that action. Records are named from and owned by the share's UID: deleting a share, or restoring it under a new UID, discards them, and the next namespace of that name then takes the directory |

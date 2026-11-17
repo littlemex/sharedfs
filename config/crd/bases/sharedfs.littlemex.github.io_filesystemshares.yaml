@@ -189,6 +189,7 @@ spec:
                       gid is the group of the created directory. Pods write through it, for example with
                       runAsGroup or supplementalGroups.
                     format: int64
+                    maximum: 4294967294
                     minimum: 0
                     type: integer
                   mode:
@@ -221,10 +222,13 @@ spec:
                     x-kubernetes-validations:
                     - message: set storage, inodes or both
                       rule: has(self.storage) || has(self.inodes)
+                    - message: storage must be positive
+                      rule: '!has(self.storage) || quantity(self.storage).isGreaterThan(quantity(''0''))'
                   uid:
                     default: 0
                     description: uid owns the created directory.
                     format: int64
+                    maximum: 4294967294
                     minimum: 0
                     type: integer
                 required:

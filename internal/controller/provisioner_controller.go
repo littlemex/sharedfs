@@ -242,8 +242,9 @@ func (r *ProvisionerReconciler) directory(ctx context.Context, pvc *corev1.Persi
 		res, err := r.pending(pvc, sharedfsv1alpha1.EventDirectoryNotReady, fmt.Sprintf("directory %s (%s) is not prepared: %s", expanded, name, msg))
 		return res, true, err
 	}
-	if share.Spec.Provision.Quota != nil {
-		// A directory of a share with a quota is handed out only once its limit holds.
+	if share.Spec.Provision.Quota != nil && dir.Status.Quota == nil {
+		// A directory of a share with a quota is handed out only once a limit holds; while a
+		// changed limit is being applied, the earlier one still does.
 		if c := meta.FindStatusCondition(dir.Status.Conditions, sharedfsv1alpha1.ConditionQuotaApplied); c == nil || c.Status != metav1.ConditionTrue {
 			msg := sharedfsv1alpha1.ReasonQuotaPending
 			if c != nil {
@@ -337,13 +338,14 @@ func (r *ProvisionerReconciler) reconcileBound(ctx context.Context, pvc *corev1.
 	if wait := time.Until(at); wait > 0 {
 		return ctrl.Result{RequeueAfter: wait + time.Second}, nil
 	}
-	// The cache may lag a grant that was just restored: decide on live objects.
-	if v, err := r.verdict(ctx, r.APIReader, pvc, &pv); err != nil || v.granted || v.hold != "" {
-		return ctrl.Result{RequeueAfter: time.Second}, err
-	}
+	// The rate limit first, so a long queue of revocations does not spend API calls each retry.
 	if r.RevocationLimiter != nil && !r.RevocationLimiter.Allow() {
 		metrics.Revocations.WithLabelValues("ratelimited").Inc()
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	// The cache may lag a grant that was just restored: decide on live objects.
+	if v, err := r.verdict(ctx, r.APIReader, pvc, &pv); err != nil || v.granted || v.hold != "" {
+		return ctrl.Result{RequeueAfter: time.Second}, err
 	}
 	if err := r.Delete(ctx, pvc, client.Preconditions{UID: &pvc.UID}); err != nil {
 		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {

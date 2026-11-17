@@ -24,24 +24,30 @@ import (
 const (
 	Applied   = sharedfsv1alpha1.ReasonQuotaApplied
 	NotTagged = sharedfsv1alpha1.ReasonDirectoryNotTagged
+	InUse     = sharedfsv1alpha1.ReasonProjectInUse
 	Failed    = sharedfsv1alpha1.ReasonQuotaFailed
 )
 
 // Outcomes lists every outcome a quota pod may report.
-var Outcomes = []string{Applied, NotTagged, Failed}
+var Outcomes = []string{Applied, NotTagged, InUse, Failed}
 
-// Request is one directory's limits. Zero means no limit.
+// Request is one directory's limits. Zero means no limit; both zero clears the limits.
 type Request struct {
 	Path       string
 	ProjectID  uint32
 	StorageKiB int64
 	Inodes     int64
+	// FirstApply asks for a check that the project counts nothing but the directory itself, so an
+	// ID that some other directory already uses is never taken over.
+	FirstApply bool
 }
 
-// Result is reported back to the controller.
+// Result is reported back to the controller, with the limits read back after setting them.
 type Result struct {
-	Outcome string `json:"outcome"`
-	Message string `json:"message,omitempty"`
+	Outcome    string `json:"outcome"`
+	Message    string `json:"message,omitempty"`
+	StorageKiB int64  `json:"storageKiB,omitempty"`
+	Inodes     int64  `json:"inodes,omitempty"`
 }
 
 // JSON encodes a result.
@@ -64,7 +70,8 @@ func Run(ctx context.Context, req Request) Result {
 	if err != nil {
 		return Result{Outcome: Failed, Message: fmt.Sprintf("reading the project ID: %v", err)}
 	}
-	if id != req.ProjectID || !inherit {
+	clearing := req.StorageKiB == 0 && req.Inodes == 0
+	if !clearing && (id != req.ProjectID || !inherit) {
 		return Result{Outcome: NotTagged, Message: fmt.Sprintf(
 			"the directory has project ID %d (inherit %t), not %d: it existed before sharedfs; an admin can tag it with "+
 				"`lfs project -p %d -r -s <dir>` and then the limit applies", id, inherit, req.ProjectID, req.ProjectID)}
@@ -72,6 +79,16 @@ func Run(ctx context.Context, req Request) Result {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	p := strconv.FormatUint(uint64(req.ProjectID), 10)
+	if req.FirstApply {
+		out, err := exec.CommandContext(ctx, "lfs", "quota", "-p", p, req.Path).CombinedOutput()
+		if err != nil {
+			return Result{Outcome: Failed, Message: fmt.Sprintf("lfs quota: %v: %s", err, strings.TrimSpace(string(out)))}
+		}
+		if files, ok := usedFiles(string(out)); !ok || files > 1 {
+			return Result{Outcome: InUse, Message: fmt.Sprintf(
+				"project %d already counts %d files: another directory uses this ID (another cluster on the same file system, or a record that was deleted); give each cluster its own --project-id-base", req.ProjectID, files)}
+		}
+	}
 	out, err := exec.CommandContext(ctx, "lfs", "setquota", "-p", p,
 		"-B", strconv.FormatInt(req.StorageKiB, 10)+"k", "-I", strconv.FormatInt(req.Inodes, 10), req.Path).CombinedOutput()
 	if err != nil {
@@ -81,10 +98,24 @@ func Run(ctx context.Context, req Request) Result {
 	if err != nil {
 		return Result{Outcome: Failed, Message: fmt.Sprintf("lfs quota: %v: %s", err, strings.TrimSpace(string(out)))}
 	}
-	if got, ok := limits(string(out)); !ok || got[0] != req.StorageKiB || got[1] != req.Inodes {
+	got, ok := limits(string(out))
+	if !ok || got[0] != req.StorageKiB || got[1] != req.Inodes {
 		return Result{Outcome: Failed, Message: fmt.Sprintf("limits read back as %v, wanted [%d %d]: %s", got, req.StorageKiB, req.Inodes, strings.TrimSpace(string(out)))}
 	}
-	return Result{Outcome: Applied}
+	return Result{Outcome: Applied, StorageKiB: got[0], Inodes: got[1]}
+}
+
+// usedFiles parses the files in use from `lfs quota -p` output.
+func usedFiles(out string) (int64, bool) {
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 9 || !strings.HasPrefix(f[0], "/") {
+			continue
+		}
+		n, err := strconv.ParseInt(strings.TrimSuffix(f[5], "*"), 10, 64)
+		return n, err == nil
+	}
+	return 0, false
 }
 
 // limits parses the block and inode hard limits from `lfs quota -p` output: the data line has

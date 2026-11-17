@@ -8,9 +8,10 @@ import (
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -31,22 +32,36 @@ type QuotaConfig struct {
 	// Namespace of quota pods and their internal claims; empty turns quotas off.
 	Namespace string
 	// Image carries the controller binary and lfs.
-	Image          string
-	ServiceAccount string
-	NodeSelector   map[string]string
-	Tolerations    []corev1.Toleration
+	Image            string
+	ServiceAccount   string
+	NodeSelector     map[string]string
+	Tolerations      []corev1.Toleration
+	ImagePullSecrets []corev1.LocalObjectReference
+	// MaxPods bounds the quota pods running at once.
+	MaxPods int
 }
 
-// ProjectIDs hands out Lustre project IDs, unique among directory records. Only the leader
-// reconciles, and the lock covers the read of every record and the write of the new one.
+// ProjectIDs hands out Lustre project IDs that are never handed out twice, even after the record
+// that held one is deleted: the next free ID is kept in a ConfigMap of the controller's
+// namespace and raised before a record takes an ID. Only the leader reconciles, and the lock
+// covers reading, reserving and writing.
 type ProjectIDs struct {
 	mu     sync.Mutex
+	Client client.Client
 	Reader client.Reader
+	// Namespace holds the ConfigMap.
+	Namespace string
 	// Base is the first ID handed out; IDs below it are left to the admin.
 	Base int64
 }
 
-// assign calls write with the next free ID, under the lock.
+const (
+	projectIDsConfigMap = "sharedfs-project-ids"
+	projectIDsKey       = "next"
+)
+
+// assign reserves the next ID and calls write with it, under the lock. An ID reserved but not
+// written (a failed write) is skipped, never reused.
 func (p *ProjectIDs) assign(ctx context.Context, write func(id int64) error) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -56,12 +71,41 @@ func (p *ProjectIDs) assign(ctx context.Context, write func(id int64) error) err
 	}
 	next := p.Base
 	for _, d := range list.Items {
-		if d.Spec.ProjectID >= next {
-			next = d.Spec.ProjectID + 1
+		next = max(next, d.Spec.ProjectID+1)
+	}
+	var cm corev1.ConfigMap
+	key := types.NamespacedName{Namespace: p.Namespace, Name: projectIDsConfigMap}
+	err := p.Reader.Get(ctx, key, &cm)
+	switch {
+	case apierrors.IsNotFound(err):
+		cm = corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: p.Namespace, Name: projectIDsConfigMap,
+			Labels: map[string]string{"app.kubernetes.io/name": "sharedfs"}}}
+	case err != nil:
+		return err
+	default:
+		if v, err := strconv.ParseInt(cm.Data[projectIDsKey], 10, 64); err == nil {
+			next = max(next, v)
 		}
+	}
+	if next > maxProjectID {
+		return fmt.Errorf("no project IDs left above %d", maxProjectID)
+	}
+	if cm.Data == nil {
+		cm.Data = map[string]string{}
+	}
+	cm.Data[projectIDsKey] = strconv.FormatInt(next+1, 10)
+	if cm.ResourceVersion == "" {
+		err = p.Client.Create(ctx, &cm)
+	} else {
+		err = p.Client.Update(ctx, &cm)
+	}
+	if err != nil {
+		return err
 	}
 	return write(next)
 }
+
+const maxProjectID = 4294967294
 
 // QuotaReconciler gives the directory of a share with a quota a project ID and keeps the
 // share's limits set on that project. The ID is set on the directory when the preparer creates
@@ -75,6 +119,7 @@ type QuotaReconciler struct {
 }
 
 // +kubebuilder:rbac:groups=sharedfs.littlemex.github.io,resources=filesystemsharedirectories,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups="",namespace=system,resources=configmaps,verbs=get;list;watch;create;update
 
 func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var dir sharedfsv1alpha1.FilesystemShareDirectory
@@ -90,7 +135,8 @@ func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 	t := r.task(&dir)
 	before := dir.DeepCopy()
-	if share.UID != dir.Spec.ShareRef.UID || share.Spec.Provision == nil || share.Spec.Provision.Quota == nil {
+	noQuota := share.UID != dir.Spec.ShareRef.UID || share.Spec.Provision == nil || share.Spec.Provision.Quota == nil
+	if noQuota && (dir.Status.Quota == nil || dir.Spec.ProjectID == 0 || share.UID != dir.Spec.ShareRef.UID) {
 		meta.RemoveStatusCondition(&dir.Status.Conditions, sharedfsv1alpha1.ConditionQuotaApplied)
 		dir.Status.Quota = nil
 		if err := updateDirStatus(ctx, r.Client, &dir, before); err != nil {
@@ -98,7 +144,7 @@ func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 		return ctrl.Result{}, r.cleanupIfConfigured(ctx, t)
 	}
-	if dir.Spec.ProjectID == 0 {
+	if !noQuota && dir.Spec.ProjectID == 0 {
 		// Quota added to a share that already has records: give them IDs; directories already
 		// created report DirectoryNotTagged below.
 		return requeueSoon, r.ProjectIDs.assign(ctx, func(id int64) error {
@@ -110,7 +156,11 @@ func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	if !meta.IsStatusConditionTrue(dir.Status.Conditions, sharedfsv1alpha1.ConditionPrepared) || dir.Status.Observed == nil {
 		return ctrl.Result{}, nil
 	}
-	want := applied(share.Spec.Provision.Quota)
+	// A quota removed from the share clears the limits it set; the project ID stays.
+	want := &sharedfsv1alpha1.AppliedQuota{}
+	if !noQuota {
+		want = applied(share.Spec.Provision.Quota)
+	}
 	cond := func(ok bool, reason, msg string) {
 		setCondition(&dir.Status.Conditions, dir.Generation, sharedfsv1alpha1.ConditionQuotaApplied, ok, reason, msg)
 	}
@@ -118,14 +168,23 @@ func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	case r.Quota.Namespace == "" || r.Quota.Image == "":
 		cond(false, sharedfsv1alpha1.ReasonQuotaNotConfigured, "the controller runs without --quota-namespace and --quota-image")
 		return ctrl.Result{}, updateDirStatus(ctx, r.Client, &dir, before)
-	case equality.Semantic.DeepEqual(dir.Status.Quota, want) &&
+	case sameLimits(dir.Status.Quota, want) &&
 		meta.IsStatusConditionTrue(dir.Status.Conditions, sharedfsv1alpha1.ConditionQuotaApplied):
 		return ctrl.Result{}, t.cleanup(ctx)
 	}
-	if !equality.Semantic.DeepEqual(dir.Status.Quota, want) && meta.IsStatusConditionTrue(dir.Status.Conditions, sharedfsv1alpha1.ConditionQuotaApplied) {
+	if !sameLimits(dir.Status.Quota, want) && meta.IsStatusConditionTrue(dir.Status.Conditions, sharedfsv1alpha1.ConditionQuotaApplied) {
 		cond(false, sharedfsv1alpha1.ReasonQuotaPending, "the share's limits changed")
 	}
+	firstApply := dir.Status.Quota == nil
 	res, state, err := t.run(ctx, &dir, isReady(&share), func() (string, *corev1.Pod, bool, error) {
+		// A change of limits on a large share would otherwise start a pod per directory at once.
+		var pods corev1.PodList
+		if err := r.List(ctx, &pods, client.InNamespace(r.Quota.Namespace), client.HasLabels{sharedfsv1alpha1.LabelInternal}); err != nil {
+			return "", nil, false, err
+		}
+		if len(pods.Items) >= max(r.Quota.MaxPods, 1) {
+			return "", nil, true, nil
+		}
 		args := []string{
 			"set-quota",
 			"--path=" + quotaMountPath,
@@ -133,17 +192,28 @@ func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			"--storage-kib=" + strconv.FormatInt(kib(want.Storage), 10),
 			"--inodes=" + strconv.FormatInt(deref(want.Inodes), 10),
 		}
-		cfg := PreparerConfig{ServiceAccount: r.Quota.ServiceAccount, NodeSelector: r.Quota.NodeSelector, Tolerations: r.Quota.Tolerations}
-		// SYS_ADMIN only: setting a quota is a quotactl, which Lustre allows only to it. The pod
-		// mounts the directory itself, read-write because Lustre refuses quotactl on a read-only
-		// mount, and has no token.
-		return dir.Spec.Path, taskPod(cfg, r.Quota.Image, []corev1.Capability{"SYS_ADMIN"}, quotaMountPath, args), false, nil
+		if firstApply {
+			args = append(args, "--first-apply")
+		}
+		cfg := PreparerConfig{ServiceAccount: r.Quota.ServiceAccount, NodeSelector: r.Quota.NodeSelector,
+			Tolerations: r.Quota.Tolerations, ImagePullSecrets: r.Quota.ImagePullSecrets}
+		// SYS_ADMIN for the quotactl, which Lustre allows only to it, and DAC_READ_SEARCH to open a
+		// directory whatever its owner and mode. The pod mounts the directory itself, read-write
+		// because Lustre refuses quotactl on a read-only mount, and has no token.
+		return dir.Spec.Path, taskPod(cfg, r.Quota.Image, []corev1.Capability{"SYS_ADMIN", "DAC_READ_SEARCH"}, quotaMountPath, args), false, nil
 	}, func(report taskReport, raw string) bool {
 		var out quota.Result
 		_ = json.Unmarshal([]byte(raw), &out)
 		ok := out.Outcome == quota.Applied
-		if ok {
-			dir.Status.Quota = want
+		switch {
+		case ok && out.StorageKiB == 0 && out.Inodes == 0:
+			// Cleared because the share no longer has a quota.
+			dir.Status.Quota = nil
+			meta.RemoveStatusCondition(&dir.Status.Conditions, sharedfsv1alpha1.ConditionQuotaApplied)
+			return true
+		case ok:
+			// What the pod read back, which may differ from the share if it changed meanwhile.
+			dir.Status.Quota = fromKiB(out.StorageKiB, out.Inodes)
 		}
 		cond(ok, out.Outcome, truncate(out.Message))
 		return ok
@@ -183,6 +253,25 @@ func applied(q *sharedfsv1alpha1.Quota) *sharedfsv1alpha1.AppliedQuota {
 	if q.Storage != nil {
 		s := q.Storage.DeepCopy()
 		a.Storage = &s
+	}
+	return a
+}
+
+// sameLimits compares limits as the quota pod sets them, in KiB and inodes.
+func sameLimits(a, b *sharedfsv1alpha1.AppliedQuota) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return kib(a.Storage) == kib(b.Storage) && deref(a.Inodes) == deref(b.Inodes)
+}
+
+func fromKiB(storageKiB, inodes int64) *sharedfsv1alpha1.AppliedQuota {
+	a := &sharedfsv1alpha1.AppliedQuota{}
+	if storageKiB > 0 {
+		a.Storage = resource.NewQuantity(storageKiB*1024, resource.BinarySI)
+	}
+	if inodes > 0 {
+		a.Inodes = &inodes
 	}
 	return a
 }

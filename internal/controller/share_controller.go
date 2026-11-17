@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	sharedfsv1alpha1 "github.com/littlemex/sharedfs/api/v1alpha1"
@@ -122,7 +123,11 @@ func (r *ShareReconciler) check(ctx context.Context, share *sharedfsv1alpha1.Fil
 		}
 		return "", "", err
 	}
-	if prev := share.Status.Resolved; prev != nil && share.Status.Volumes > 0 {
+	records, err := r.records(ctx, share)
+	if err != nil {
+		return "", "", err
+	}
+	if prev := share.Status.Resolved; prev != nil && (share.Status.Volumes > 0 || records > 0) {
 		// Volumes made from the old source keep mounting it; new ones would mount another file
 		// system under the same share and directory records.
 		old := &volume.Source{VolumeAttributes: prev.VolumeAttributes}
@@ -133,7 +138,7 @@ func (r *ShareReconciler) check(ctx context.Context, share *sharedfsv1alpha1.Fil
 		nfs, nbase := src.Identity()
 		if ofs != nfs || obase != nbase {
 			return sharedfsv1alpha1.ReasonSourceChanged, fmt.Sprintf(
-				"PersistentVolume %s now points at another file system than the %d volume(s) of this share; restore it, or create a new share", pv.Name, share.Status.Volumes), nil
+				"PersistentVolume %s now points at another file system than the %d volume(s) and %d directory record(s) of this share; restore it, or create a new share", pv.Name, share.Status.Volumes, records), nil
 		}
 	}
 	share.Status.Resolved = src.Status()
@@ -176,11 +181,53 @@ func (r *ShareReconciler) check(ctx context.Context, share *sharedfsv1alpha1.Fil
 			}
 		}
 	}
+	if w, err := r.quotaWarning(ctx, share); err != nil {
+		return "", "", err
+	} else if w != "" {
+		warnings = append(warnings, w)
+	}
 	msg := fmt.Sprintf("%s on %s, path %s", src.VolumeHandle, src.Profile.Name, share.Spec.Path)
 	for _, w := range warnings {
 		msg += "; warning: " + w
 	}
 	return sharedfsv1alpha1.ReasonResolved, msg, nil
+}
+
+// records counts the share's directory records.
+func (r *ShareReconciler) records(ctx context.Context, share *sharedfsv1alpha1.FilesystemShare) (int, error) {
+	var list sharedfsv1alpha1.FilesystemShareDirectoryList
+	if err := r.List(ctx, &list, client.MatchingFields{indexDirShare: string(share.UID)}); err != nil {
+		return 0, err
+	}
+	return len(list.Items), nil
+}
+
+// quotaWarning names the namespaces a share with a quota grants ReadWrite that do not enforce Pod
+// Security restricted: a root process there can move files to another project, out of the
+// quota or into another team's (measured), unless root squash is on.
+func (r *ShareReconciler) quotaWarning(ctx context.Context, share *sharedfsv1alpha1.FilesystemShare) (string, error) {
+	if share.Spec.Provision == nil || share.Spec.Provision.Quota == nil || !grantsReadWrite(share) {
+		return "", nil
+	}
+	var list corev1.NamespaceList
+	if err := r.List(ctx, &list); err != nil {
+		return "", err
+	}
+	var names []string
+	for i := range list.Items {
+		ns := &list.Items[i]
+		if ok, _ := grantFor(share, ns, sharedfsv1alpha1.AccessReadWrite); ok && ns.Labels["pod-security.kubernetes.io/enforce"] != "restricted" {
+			names = append(names, ns.Name)
+		}
+	}
+	if len(names) == 0 {
+		return "", nil
+	}
+	if len(names) > 5 {
+		names = append(names[:5], "...")
+	}
+	return fmt.Sprintf("namespaces %s are not Pod Security restricted: unless root squash is on, a root pod there can take files out of the quota",
+		strings.Join(names, ", ")), nil
 }
 
 // checkDriver refuses drivers whose CSIDriver object would undo the guarantees: a "File"
@@ -444,6 +491,9 @@ func (r *ShareReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&storagev1.StorageClass{}).
 		Watches(&corev1.PersistentVolume{}, handler.EnqueueRequestsFromMapFunc(r.sharesForPV)).
 		Watches(&storagev1.CSIDriver{}, handler.EnqueueRequestsFromMapFunc(r.allShares)).
+		// Namespace labels decide grants, and Pod Security labels the quota warning.
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.allShares),
+			builder.WithPredicates(predicate.LabelChangedPredicate{})).
 		// A share's change can change another share's overlap verdict.
 		Watches(&sharedfsv1alpha1.FilesystemShare{}, handler.EnqueueRequestsFromMapFunc(r.allShares),
 			builder.WithPredicates(shareChanged)).

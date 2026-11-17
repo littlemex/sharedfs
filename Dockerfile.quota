@@ -1,6 +1,6 @@
 # Image of quota pods: the controller binary (its set-quota subcommand) and lfs from the Lustre
 # client utilities. Build it, push it, and pass it by digest as --quota-image.
-FROM public.ecr.aws/docker/library/golang:1.26 AS builder
+FROM public.ecr.aws/docker/library/golang:1.26@sha256:4165ee6bf3b7811fd7b40373290405c83d0167dcb87ee5f29c427cdcef45ff8f AS builder
 WORKDIR /workspace
 COPY go.mod go.sum ./
 RUN go mod download
@@ -9,7 +9,7 @@ COPY api/ api/
 COPY internal/ internal/
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o manager ./cmd
 
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023
-RUN dnf install -y lustre-client && dnf clean all && rm -rf /var/cache/dnf
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023@sha256:5c6ed3b38335b2aa424a045f1e564c8c508409ead0ff3f8bf5e62c31b94082cb
+RUN dnf install -y lustre-client-2.15.6 && dnf clean all && rm -rf /var/cache/dnf
 COPY --from=builder /workspace/manager /manager
 ENTRYPOINT ["/manager"]

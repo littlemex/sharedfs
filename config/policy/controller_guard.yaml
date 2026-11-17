@@ -1,23 +1,40 @@
-# Bounds what the controller's own service account can do, so a compromised controller cannot
-# turn its ClusterRole into node or file-system access: the volumes it creates are CSI volumes of
-# the supported drivers named sfs-*, the claims it deletes are bound to such volumes, and the pods
-# it runs mount only its internal claims. It applies to requests by the controller only. The
-# names assume the namespace and name prefix of config/default; change them together.
+# Bounds what the controller's service account can do with its ClusterRole: the volumes it creates
+# are CSI volumes of the supported drivers, named sfs-*, with a sharedfs handle and a claim
+# reference; the claims it creates are its internal ones, bound by name to their volume; the
+# claims and volumes it deletes are its own; and the pods it runs have the exact shape of its
+# preparer and quota pods, from the image repositories in the sharedfs-guard ConfigMap, by digest.
+#
+# What remains: such a volume can still point at any directory of a supported file system, so
+# the controller stays part of the trusted base for file-system access. The names below assume
+# the namespaces and name prefix of config/default and config/quota; change them together.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: guard
+  namespace: system
+  labels:
+    app.kubernetes.io/name: sharedfs
+data:
+  # Repositories (no tag, no digest) preparer and quota pods may run from. The preparer runs the
+  # controller's image; set both before deploying.
+  preparerRepository: registry.example.com/sharedfs-controller
+  quotaRepository: registry.example.com/sharedfs-quota
+---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
   name: controller-guard
   labels:
     app.kubernetes.io/name: sharedfs
-    app.kubernetes.io/managed-by: kustomize
 spec:
   failurePolicy: Fail
+  paramKind: {apiVersion: v1, kind: ConfigMap}
   matchConstraints:
     resourceRules:
     - apiGroups: [""]
       apiVersions: ["v1"]
       operations: ["CREATE", "UPDATE"]
-      resources: ["persistentvolumes", "pods"]
+      resources: ["persistentvolumes", "persistentvolumeclaims", "pods"]
     - apiGroups: [""]
       apiVersions: ["v1"]
       operations: ["DELETE"]
@@ -25,33 +42,60 @@ spec:
   matchConditions:
   - name: by-controller
     expression: "request.userInfo.username == 'system:serviceaccount:sharedfs-system:sharedfs-controller-manager'"
+  variables:
+  - name: internal
+    expression: "['sharedfs-system', 'sharedfs-quota']"
   validations:
   - expression: >-
       request.kind.kind != 'PersistentVolume' || request.operation == 'DELETE' ||
       (object.metadata.name.startsWith('sfs-') && has(object.spec.csi) &&
        object.spec.csi.driver in ['fsx.csi.aws.com', 'fsx.openzfs.csi.aws.com'] &&
-       object.spec.csi.volumeHandle.startsWith('sharedfs:'))
-    message: "the sharedfs controller may only create CSI volumes of the supported drivers named sfs-* with a sharedfs handle"
-  - expression: >-
-      request.kind.kind != 'Pod' ||
-      (((object.metadata.namespace == 'sharedfs-system' && object.metadata.name.startsWith('sfs-prep-') &&
-         object.spec.containers.all(c, c.securityContext.capabilities.add.all(a, a == 'CHOWN'))) ||
-        (object.metadata.namespace == 'sharedfs-quota' && object.metadata.name.startsWith('sfs-quota-') &&
-         object.spec.containers.all(c, c.securityContext.capabilities.add.all(a, a == 'SYS_ADMIN')))) &&
-       object.spec.containers.all(c, c.image.contains('@sha256:') && !has(c.securityContext.privileged) &&
-         c.securityContext.capabilities.drop.exists(d, d == 'ALL')) &&
-       !has(object.spec.initContainers) && !has(object.spec.ephemeralContainers) &&
-       object.spec.automountServiceAccountToken == false &&
-       object.spec.volumes.all(v, has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == object.metadata.name))
-    message: "the sharedfs controller may only run its preparer and quota pods: pinned image, only CHOWN or only SYS_ADMIN, no token, only their own internal claim"
+       object.spec.csi.volumeHandle.startsWith('sharedfs:') &&
+       has(object.spec.claimRef) && has(object.spec.claimRef.uid) &&
+       (!object.metadata.name.startsWith('sfs-prep-') && !object.metadata.name.startsWith('sfs-quota-') ||
+        (object.spec.claimRef.namespace in variables.internal && object.spec.claimRef.name == object.metadata.name)))
+    message: "the sharedfs controller may only create CSI volumes of the supported drivers named sfs-*, with a sharedfs handle, reserved for a claim by UID"
   - expression: >-
       request.kind.kind != 'PersistentVolume' || request.operation != 'DELETE' || oldObject.metadata.name.startsWith('sfs-')
     message: "the sharedfs controller may only delete its own volumes (sfs-*)"
   - expression: >-
-      request.kind.kind != 'PersistentVolumeClaim' ||
+      request.kind.kind != 'PersistentVolumeClaim' || request.operation != 'CREATE' ||
+      (object.metadata.namespace in variables.internal &&
+       (object.metadata.name.startsWith('sfs-prep-') || object.metadata.name.startsWith('sfs-quota-')) &&
+       object.spec.volumeName == object.metadata.name)
+    message: "the sharedfs controller may only create its internal claims, bound by name to their volume"
+  - expression: >-
+      request.kind.kind != 'PersistentVolumeClaim' || request.operation != 'DELETE' ||
       oldObject.metadata.name.startsWith('sfs-prep-') || oldObject.metadata.name.startsWith('sfs-quota-') ||
       (has(oldObject.spec.volumeName) && oldObject.spec.volumeName.startsWith('sfs-'))
     message: "the sharedfs controller may only delete claims bound to sharedfs volumes"
+  - expression: >-
+      request.kind.kind != 'Pod' || request.operation != 'CREATE' ||
+      ((object.metadata.namespace == 'sharedfs-system' && object.metadata.name.startsWith('sfs-prep-') &&
+        object.spec.containers.all(c, c.image.split('@')[0] == params.data.preparerRepository &&
+          c.securityContext.capabilities.add.all(a, a == 'CHOWN'))) ||
+       (object.metadata.namespace == 'sharedfs-quota' && object.metadata.name.startsWith('sfs-quota-') &&
+        object.spec.containers.all(c, c.image.split('@')[0] == params.data.quotaRepository &&
+          c.securityContext.capabilities.add.all(a, a in ['SYS_ADMIN', 'DAC_READ_SEARCH']))))
+    message: "the sharedfs controller may only run its preparer and quota pods, from the configured repositories, with their capabilities"
+  - expression: >-
+      request.kind.kind != 'Pod' || request.operation != 'CREATE' ||
+      (object.spec.containers.size() == 1 &&
+       object.spec.containers.all(c, c.image.contains('@sha256:') &&
+         has(c.securityContext) && has(c.securityContext.capabilities) &&
+         c.securityContext.capabilities.drop.exists(d, d == 'ALL') &&
+         !(has(c.securityContext.privileged) && c.securityContext.privileged) &&
+         has(c.securityContext.allowPrivilegeEscalation) && !c.securityContext.allowPrivilegeEscalation) &&
+       !(has(object.spec.hostNetwork) && object.spec.hostNetwork) &&
+       !(has(object.spec.hostPID) && object.spec.hostPID) &&
+       !(has(object.spec.hostIPC) && object.spec.hostIPC) &&
+       has(object.spec.securityContext) && has(object.spec.securityContext.seccompProfile) &&
+       object.spec.securityContext.seccompProfile.type == 'RuntimeDefault' &&
+       !has(object.spec.initContainers) && !has(object.spec.ephemeralContainers) &&
+       has(object.spec.automountServiceAccountToken) && !object.spec.automountServiceAccountToken &&
+       object.spec.volumes.size() == 1 &&
+       object.spec.volumes.all(v, has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == object.metadata.name))
+    message: "a task pod must be one container by digest, dropping all other capabilities, without privilege, host namespaces or a token, with RuntimeDefault seccomp, mounting only its own internal claim"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -59,7 +103,10 @@ metadata:
   name: controller-guard
   labels:
     app.kubernetes.io/name: sharedfs
-    app.kubernetes.io/managed-by: kustomize
 spec:
   policyName: controller-guard
+  paramRef:
+    name: sharedfs-guard
+    namespace: sharedfs-system
+    parameterNotFoundAction: Deny
   validationActions: [Deny]

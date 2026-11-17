@@ -94,8 +94,8 @@ spec:
             port: 8081
           initialDelaySeconds: 5
           periodSeconds: 10
-        # Measured with 200 claims and their volumes cached; raise the limit with the number of
-        # PersistentVolumeClaims and PersistentVolumes in the cluster (all are cached).
+        # The leader used about 45 MiB with 800 PersistentVolumes and claims cached (all of the
+        # cluster's are); raise the limit for clusters ten times larger.
         resources:
           limits:
             memory: 512Mi

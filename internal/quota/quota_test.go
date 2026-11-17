@@ -11,6 +11,9 @@ pid 4242 is using default file quota setting
 	if got, ok := limits(out); !ok || got != [2]int64{51200, 1000} {
 		t.Fatal(got, ok)
 	}
+	if n, ok := usedFiles(out); !ok || n != 0 {
+		t.Fatal(n, ok)
+	}
 	if _, ok := limits("nothing"); ok {
 		t.Fatal("no data line must not parse")
 	}

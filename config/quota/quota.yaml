@@ -52,3 +52,40 @@ metadata:
 spec:
   podSelector: {}
   policyTypes: [Ingress, Egress]
+---
+# The quota namespace is privileged, so nobody but the controller may run pods there, or exec,
+# attach or add ephemeral containers to them; the controller's own pods are further bound by
+# config/policy (controller-guard).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: sharedfs-quota-namespace
+  labels: {app.kubernetes.io/name: sharedfs}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: sharedfs-quota}
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["pods", "pods/ephemeralcontainers"]
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CONNECT"]
+      resources: ["pods/exec", "pods/attach", "pods/portforward"]
+  validations:
+  - expression: >-
+      (request.subResource == '' && request.userInfo.username == 'system:serviceaccount:sharedfs-system:sharedfs-controller-manager') ||
+      (request.subResource == '' && request.operation == 'UPDATE')
+    message: "only the sharedfs controller runs pods in sharedfs-quota, and nobody execs into them"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: sharedfs-quota-namespace
+  labels: {app.kubernetes.io/name: sharedfs}
+spec:
+  policyName: sharedfs-quota-namespace
+  validationActions: [Deny]

@@ -1,0 +1,42 @@
+# Sample: grants select namespaces by label, so only platform admins may set or change the
+# labels they use. This denies everyone else adding, changing or removing labels under
+# sharedfs.example/ (the prefix the sample shares use) and the Pod Security labels, on create and
+# update. Replace the prefix and the admin group with your own.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: sharedfs-namespace-labels
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["namespaces"]
+  matchConditions:
+  - name: not-admin
+    expression: "!('platform-admins' in request.userInfo.groups) && !('system:masters' in request.userInfo.groups)"
+  variables:
+  - name: guarded
+    expression: >-
+      (has(object.metadata.labels) ? object.metadata.labels : {}).filter(k,
+        k.startsWith('sharedfs.example/') || k.startsWith('pod-security.kubernetes.io/'))
+  - name: before
+    expression: >-
+      request.operation == 'CREATE' || !has(oldObject.metadata.labels) ? [] :
+      oldObject.metadata.labels.filter(k, k.startsWith('sharedfs.example/') || k.startsWith('pod-security.kubernetes.io/'))
+  validations:
+  - expression: >-
+      request.operation == 'CREATE' ? variables.guarded.size() == 0 :
+      (variables.guarded.size() == variables.before.size() &&
+       variables.guarded.all(k, k in oldObject.metadata.labels && oldObject.metadata.labels[k] == object.metadata.labels[k]))
+    messageExpression: "'only platform admins may set namespace labels that grant storage or relax Pod Security'"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: sharedfs-namespace-labels
+spec:
+  policyName: sharedfs-namespace-labels
+  validationActions: [Deny]

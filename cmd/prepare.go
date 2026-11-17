@@ -91,6 +91,7 @@ func setQuota(args []string) int {
 	id := fs.Uint("project-id", 0, "the directory's project ID")
 	fs.Int64Var(&req.StorageKiB, "storage-kib", 0, "hard limit of data in KiB, 0 for none")
 	fs.Int64Var(&req.Inodes, "inodes", 0, "hard limit of inodes, 0 for none")
+	fs.BoolVar(&req.FirstApply, "first-apply", false, "check that the project counts nothing but the directory")
 	out := fs.String("report", terminationLog, "file the JSON result is written to")
 	var res quota.Result
 	if err := fs.Parse(args); err != nil || req.Path == "" {
@@ -119,6 +120,9 @@ func preparerConfig(ctx context.Context, c client.Reader, image, sa, nodeSelecto
 	}
 	if cfg.Namespace == "" {
 		return cfg, errors.New("POD_NAMESPACE is not set")
+	}
+	if cfg.Image != "" && !strings.Contains(cfg.Image, "@sha256:") {
+		return cfg, errors.New("--preparer-image must name an image by digest")
 	}
 	if cfg.Image == "" {
 		name := os.Getenv("POD_NAME")

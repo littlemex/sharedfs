@@ -108,7 +108,7 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(SetupIndexes(ctx, mgr)).To(Succeed())
 	recorder := mgr.GetEventRecorder("sharedfs")
-	projectIDs := &ProjectIDs{Reader: mgr.GetAPIReader(), Base: 1000000}
+	projectIDs := &ProjectIDs{Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Namespace: controllerNamespace, Base: 1000000}
 	Expect((&ShareReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader()}).SetupWithManager(mgr)).To(Succeed())
 	Expect((&ProvisionerReconciler{
 		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Recorder: recorder,
@@ -119,7 +119,7 @@ var _ = BeforeSuite(func() {
 	}}).SetupWithManager(mgr)).To(Succeed())
 	Expect((&ReclaimReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr)).To(Succeed())
 	Expect((&QuotaReconciler{Client: mgr.GetClient(), ProjectIDs: projectIDs, Quota: QuotaConfig{
-		Namespace: quotaNamespace, Image: quotaImage, ServiceAccount: "sharedfs-quota",
+		Namespace: quotaNamespace, Image: quotaImage, ServiceAccount: "sharedfs-quota", MaxPods: 10,
 	}}).SetupWithManager(mgr)).To(Succeed())
 	go func() {
 		defer GinkgoRecover()

@@ -200,7 +200,9 @@ func finish(parent int, tmp string, req Request, mode uint32) Result {
 		}
 		projectID = id
 	}
-	if err := renameNoReplace(parent, tmp, req.Name); err != nil {
+	if err := renameNoReplace(parent, tmp, req.Name); errors.Is(err, unix.EXDEV) {
+		return Result{Outcome: Failed, Message: "the parent directory carries a project ID with inheritance, so a directory with a project of its own cannot be moved into it; remove the parent's project (lfs project -C)"}
+	} else if err != nil {
 		if errors.Is(err, unix.EEXIST) || errors.Is(err, unix.ENOTEMPTY) {
 			// Created by someone else meanwhile: report theirs, discard ours.
 			if res, ok := existing(parent, req.Name); ok {

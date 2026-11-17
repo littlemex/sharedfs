@@ -84,7 +84,9 @@ On FSx for Lustre 2.15, `provision.quota` limits each created directory with a L
     quota: {storage: 500Gi, inodes: 2000000}
 ```
 
-Each directory record gets a project ID of its own (from `--project-id-base`, default 1000000). The preparer gives it to the directory when it creates it, with inheritance, so everything created below it counts and tenants cannot change it. A quota pod then sets the limit, and sets it again whenever the share's limits change. The quota pod runs as UID 0 with only `CAP_SYS_ADMIN`, which `lfs setquota` requires. It mounts only that directory, read-write because Lustre refuses quota changes through a read-only mount, and has no token and no network. A claim is provisioned only once its directory's limit holds. A directory that existed before sharedfs is not tagged; its record reports `DirectoryNotTagged` with the `lfs project` command an admin can run, and the limit applies on the next retry. Quota pods need a namespace of their own at Pod Security `privileged`, and an image with `lfs`:
+Each directory record gets a project ID of its own, from `--project-id-base` (default 1000000) up, never handed out twice: the next free ID is kept in the ConfigMap `sharedfs-project-ids`, so deleting a record does not free its ID. The preparer gives the ID to the directory when it creates it, with inheritance, so everything created below it counts. Before a limit is first set, the quota pod checks that the project counts nothing yet (`ProjectInUse` otherwise). Clusters that share one file system need ranges of their own: give each its own `--project-id-base`. A quota pod then sets the limit, and sets it again whenever the share's limits change. The quota pod runs as UID 0 with only `CAP_SYS_ADMIN`, which `lfs setquota` requires. It mounts only that directory, read-write because Lustre refuses quota changes through a read-only mount, and has no token and no network. A claim is provisioned only once its directory has a limit; while a changed limit is applied, the earlier one holds and claims keep being provisioned. At most `--quota-max-pods` (10) quota pods run at once. A directory that existed before the share had a quota is not tagged: its record reports `DirectoryNotTagged` with the `lfs project` command an admin can run, the limit applies on a later retry, and until then new claims for that directory wait. Adding a quota to a share in use therefore pauses new claims of its existing directories. Removing the quota clears the limits; deleting the share leaves them on the file system.
+
+A quota holds only against non-root writers. On Lustre a root process can change a file's project ID, even without `CAP_FOWNER`, and so take files out of the quota or into another team's project; a non-root owner cannot (both measured). Run namespaces granted ReadWrite on a share with a quota at Pod Security `restricted`, or turn on root squash; the share's `Ready` message names granted namespaces that are not `restricted`. The parent of the directories must not carry a project ID with inheritance itself: the kernel refuses to move a directory of another project into it, and the record reports why. Quota pods need a namespace of their own at Pod Security `privileged`, and an image with `lfs`:
 
 ```bash
 kubectl apply -k config/quota
@@ -96,6 +98,7 @@ Then start the controller with `--quota-namespace=sharedfs-quota --quota-image=r
 ## What it does not do
 
 - **It is not isolation against privileged workloads.** The boundary is the mount. A pod that is privileged, uses `hostPath`, or can create PersistentVolumes can reach the whole file system without sharedfs. Run tenant namespaces at Pod Security `baseline` or stricter.
+- **"No network" for task pods relies on NetworkPolicy being enforced** (for VPC CNI, its network policy agent turned on).
 - **The directory restriction is applied by the Lustre client.** The servers do not enforce it. From inside a directory mount, `.lustre/fid` is not visible and `fid2path` outside the directory is refused (measured on 2.12 and 2.15); `open_by_handle_at`, which needs `CAP_DAC_READ_SEARCH` and so a pod above Pod Security baseline, was not tested.
 - **`nosuid` and `nodev` are not added.** They did not take effect on FSx for Lustre mounts when measured, so a writer of a directory can leave setuid binaries for its readers. Readers of a path trust its writers. Run tenants at Pod Security `restricted` (no privilege escalation), with `baseline` as the minimum, and turn on root squash.
 - **uid, gid and mode are not a boundary on their own.** Tenants choose `runAsUser` unless a policy stops them, and without root squash a root pod ignores permissions.
@@ -137,22 +140,25 @@ make docker-build docker-push IMG=$IMG
 make deploy IMG=$IMG
 ```
 
-It runs in the namespace `sharedfs-system` as two replicas on different nodes, with a PodDisruptionBudget; only the leader reconciles, and a standby takes over within the lease duration. The namespace is labelled Pod Security `baseline`, because preparer pods need `CAP_CHOWN`, and nothing else should run there or be granted pod access there. If Kueue manages plain pods, exclude this namespace and `sharedfs-quota`. Every PersistentVolume and PersistentVolumeClaim of the cluster is cached: the leader used about 45 MiB with 800 of each, so the 512 MiB limit leaves room for clusters about ten times larger. The revocation rate limit is shared by every share: a mass revocation in one share delays revocations in others.
+It runs in the namespace `sharedfs-system` as two replicas, spread across nodes when the scheduler can, with a PodDisruptionBudget; only the leader reconciles, and a standby takes over within the lease duration. The namespace is labelled Pod Security `baseline`, because preparer pods need `CAP_CHOWN`, and nothing else should run there or be granted pod access there. If Kueue manages plain pods, exclude this namespace and `sharedfs-quota`. Every PersistentVolume and PersistentVolumeClaim of the cluster is cached: the leader used about 45 MiB with 800 of each, so the 512 MiB limit leaves room for clusters about ten times larger. The revocation rate limit is shared by every share: a mass revocation in one share delays revocations in others.
 
 The controller needs no cloud credentials. Its permissions are:
 
 | Resource | Verbs |
 |---|---|
 | PersistentVolumes | read, create, patch, delete |
-| PersistentVolumeClaims | read and delete in every namespace; create in its own |
-| Pods | read, create, delete in its own namespace |
+| PersistentVolumeClaims | read and delete in every namespace; create in its own and in `sharedfs-quota` |
+| Pods | read, create, delete in its own namespace and in `sharedfs-quota` |
+| ConfigMaps | read, create, update in its own namespace (project IDs) |
 | StorageClasses | read, create |
 | Namespaces, CSIDrivers | read |
 | FilesystemShares | read, patch, status, finalizers |
-| FilesystemShareDirectories | read, create, status, finalizers |
-| Events | create |
+| FilesystemShareDirectories | read, create, patch, status, finalizers |
+| Events | create, patch |
 
-A ValidatingAdmissionPolicy (`config/policy`) bounds what the controller's service account can do with those permissions, so a compromised controller cannot turn them into node or file-system access. It may create only CSI volumes of the supported drivers named `sfs-*` with a sharedfs handle, delete only its own volumes and claims bound to them, and run only its preparer and quota pods (image by digest, only `CHOWN` or only `SYS_ADMIN`, no token, only their own internal claim).
+A ValidatingAdmissionPolicy (`config/policy`) bounds what the controller's service account can do with those permissions, so a compromised controller cannot turn them into node access. It may create only CSI volumes of the supported drivers named `sfs-*`, with a sharedfs handle, reserved for a claim by UID; create only its internal claims; delete only its own volumes and claims bound to them; and run only its preparer and quota pods. Those must come from the repositories in the `sharedfs-guard` ConfigMap, by digest, with only `CHOWN` (preparer) or `SYS_ADMIN` and `DAC_READ_SEARCH` (quota), without privilege, host namespaces or a token, with RuntimeDefault seccomp, and mounting only their own internal claim. Set the repositories in `config/policy/controller_guard.yaml` before deploying. A volume the controller creates can still point at any directory of a supported file system, so the controller remains part of the trusted base for file-system access. `config/quota` adds a policy that lets nobody but the controller run pods in `sharedfs-quota` or exec into them.
+
+Grants select namespaces by label, so tenants must not be able to set those labels. [config/samples/namespace-label-guard.yaml](config/samples/namespace-label-guard.yaml) is a policy to adapt: it lets only an admin group set labels under a prefix, and the Pod Security labels.
 
 The `sharedfs-share-viewer` ClusterRole lets its holders list shares. A share's status shows the file system's DNS name, mount name and ID, so bind it only to users who may see those.
 
@@ -164,11 +170,12 @@ The `sharedfs-share-viewer` ClusterRole lets its holders list shares. A share's 
 | `--kube-api-qps`, `--kube-api-burst` | `50`, `100` | Client rate limits towards the API server |
 | `--quota-namespace`, `--quota-image` | none | Turn on quotas (see Quotas) |
 | `--quota-service-account` | `sharedfs-quota` | Service account of quota pods |
+| `--quota-max-pods` | `10` | Quota pods running at once |
 | `--project-id-base` | `1000000` | First Lustre project ID sharedfs hands out |
 | `--preparer-node-selector` | none | `key=value,...` for preparer pods, for example nodes exempt from root squash |
 | `--preparer-tolerations` | none | JSON list of tolerations for preparer pods |
 | `--preparer-service-account` | `sharedfs-preparer` | Service account of preparer pods; it is bound to nothing and its token is not mounted |
-| `--preparer-image` | the controller's own image, pinned to the digest it runs | Image of preparer pods; the controller refuses to start if it cannot learn its digest |
+| `--preparer-image` | the controller's own image, pinned to the digest it runs | Image of preparer pods, by digest; the controller refuses to start without one |
 | `--leader-elect` | `true` | Keep on: two active controllers would race on the same volumes |
 
 To remove sharedfs, delete the claims, then the shares, then the controller (`make undeploy`). Deleting the CRDs first deletes every share at once; deleting the controller first leaves the finalizers with no one to remove them.
@@ -189,7 +196,7 @@ sfd-7e214b5fd4eeff6523a4d8b5   checkpoints   team-a      checkpoints/team-a   Tr
 |---|---|---|
 | FilesystemShare | `Ready` | `Resolved`; `SourceNotFound`, `SourceNotCSI`, `UnsupportedDriver`, `SourceIsGenerated`, `InvalidSource`, `SourceUnreserved`, `SourceChanged`, `InvalidPath`, `SubPathUnsupported`, `InvalidGrant`, `DriverNotInstalled`, `UnsafeDriverPolicy`, `OverlappingShare`, `StorageClassTaken`, `VolumesRemaining` |
 | FilesystemShareDirectory | `Prepared` | `DirectoryCreated`, `DirectoryExists`; `Preparing`, `PreparerNotCreated`, `PreparerTimedOut`, `InsecureParent`, `NotADirectory`, `PermissionDenied`, `PreparationFailed` |
-| FilesystemShareDirectory | `QuotaApplied` | `QuotaApplied`; `QuotaPending`, `QuotaNotConfigured`, `DirectoryNotTagged`, `QuotaFailed`, `PreparerNotCreated`, `PreparerTimedOut` |
+| FilesystemShareDirectory | `QuotaApplied` | `QuotaApplied`; `QuotaPending`, `QuotaNotConfigured`, `DirectoryNotTagged`, `ProjectInUse`, `QuotaFailed`, `PreparerNotCreated`, `PreparerTimedOut` |
 | PersistentVolumeClaim | events | `Provisioned`; `NotGranted`, `UnsupportedClaim`, `ShareNotReady`, `NamespaceRecreated`, `DirectoryNotReady`, `Revoking`, `RevocationHeld`, `Revoked` |
 
 The metrics endpoint serves, besides controller-runtime's own:
