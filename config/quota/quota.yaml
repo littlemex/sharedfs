@@ -75,10 +75,13 @@ spec:
       apiVersions: ["v1"]
       operations: ["CONNECT"]
       resources: ["pods/exec", "pods/attach", "pods/portforward"]
+  variables:
+  - name: main
+    expression: "!has(request.subResource) || request.subResource == ''"
   validations:
   - expression: >-
-      (request.subResource == '' && request.userInfo.username == 'system:serviceaccount:sharedfs-system:sharedfs-controller-manager') ||
-      (request.subResource == '' && request.operation == 'UPDATE')
+      variables.main && (request.operation == 'UPDATE' ||
+        request.userInfo.username == 'system:serviceaccount:sharedfs-system:sharedfs-controller-manager')
     message: "only the sharedfs controller runs pods in sharedfs-quota, and nobody execs into them"
 ---
 apiVersion: admissionregistration.k8s.io/v1

@@ -235,7 +235,7 @@ func (r *QuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 func (r *QuotaReconciler) task(dir *sharedfsv1alpha1.FilesystemShareDirectory) *task {
 	return &task{
-		Client: r.Client, what: "quota pod", condition: sharedfsv1alpha1.ConditionQuotaApplied,
+		Client: r.Client, what: "quota", condition: sharedfsv1alpha1.ConditionQuotaApplied,
 		name: volume.QuotaName(dir.UID), namespace: r.Quota.Namespace, history: &dir.Status.QuotaSetter,
 		outcomes: quota.Outcomes, failed: quota.Failed,
 	}
