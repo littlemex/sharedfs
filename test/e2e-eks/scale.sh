@@ -6,6 +6,7 @@
 # Usage: test/e2e-eks/scale.sh <source PV name> [namespaces] [claims per namespace]
 #   CTRL_NS  the controller's namespace (default sharedfs-system)
 #   GRACE    the controller's --revocation-grace-period in seconds (default 30)
+#   RATE     the controller's --revocations-per-minute (default 30)
 set -uo pipefail
 
 SRC=${1:?source PV}; NNS=${2:-20}; NPVC=${3:-10}
@@ -13,6 +14,7 @@ ID=$(LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 5)
 P=sfsscale-$ID; KEY=sharedfs-scale/$P
 CTRL_NS=${CTRL_NS:-sharedfs-system}; DEPLOY=sharedfs-controller-manager
 GRACE=${GRACE:-30}
+RATE=${RATE:-30}  # the controller's --revocations-per-minute
 G=sharedfs.littlemex.github.io
 TOTAL=$((NNS*NPVC))
 PASS=0; FAIL=0
@@ -88,8 +90,9 @@ T1=$(date +%s)
 wait_for 60 at_least deadlines $((HALF*NPVC))
 echo "deadlines recorded after $(( $(date +%s) - T1 ))s"
 kubectl -n "$CTRL_NS" delete pod "$(leader)" --wait=false >/dev/null
-check "the revoked claims are deleted after the grace period" wait_for $((GRACE+300)) exactly count $((TOTAL-HALF*NPVC))
-echo "seconds from unlabel to all revoked claims gone: $(( $(date +%s) - T1 )) (grace ${GRACE}s)"
+# Deletions are rate-limited: the grace period, then RATE per minute.
+check "the revoked claims are deleted after the grace period, at the rate limit" wait_for $((GRACE + HALF*NPVC*60/RATE + 300)) exactly count $((TOTAL-HALF*NPVC))
+echo "seconds from unlabel to all revoked claims gone: $(( $(date +%s) - T1 )) (grace ${GRACE}s, then $((HALF*NPVC)) at $RATE per minute = $((HALF*NPVC*60/RATE))s)"
 check "their PVs are reclaimed" wait_for 300 exactly pvs $((TOTAL-HALF*NPVC))
 check "the granted half is untouched" exactly bound $((TOTAL-HALF*NPVC))
 

@@ -3,7 +3,7 @@
 #
 # Usage: test/e2e-eks/run.sh <source PV name> <node name>
 #   source PV  an existing static PV of fsx.csi.aws.com, reserved (claimRef set) or bound
-#   node       a node that can mount it; tenant pods run there
+#   node       a node that can mount it; tenant pods run there, whatever its taints
 #   CTRL_NS    the controller's namespace (default sharedfs-system)
 #   GRACE      the controller's --revocation-grace-period in seconds (default 30)
 #
@@ -64,6 +64,7 @@ kind: Pod
 metadata: {name: $2, namespace: $1}
 spec:
   nodeSelector: {kubernetes.io/hostname: $NODE}
+  tolerations: [{operator: Exists}]
   terminationGracePeriodSeconds: 1
   restartPolicy: Never
   securityContext: {runAsUser: ${4:-0}, runAsGroup: ${5:-0}, supplementalGroups: [${5:-0}]}
@@ -154,6 +155,7 @@ kind: Pod
 metadata: {name: eph, namespace: $NS_TEAM}
 spec:
   nodeSelector: {kubernetes.io/hostname: $NODE}
+  tolerations: [{operator: Exists}]
   terminationGracePeriodSeconds: 1
   restartPolicy: Never
   containers:
